@@ -32,7 +32,7 @@ def main():
     parser.add_argument('--nodes', type=int, default=184, help='number of nodes')
     parser.add_argument('--units', type=int, default=128, help='hidden units')
     parser.add_argument('--his_len', type=int, default=16, help='input sequence length')
-    parser.add_argument('--pre_len', type=int, default=12, help='output sequence length')
+    parser.add_argument('--pre_len', type=int, default=8, help='output sequence length')
 
     # graph files (we ONLY load existing adj set)
     parser.add_argument('--adj_Set', type=str, default='data/AdjSet(GE).npy',
