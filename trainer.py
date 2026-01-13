@@ -84,7 +84,6 @@ class trainer():
 
 
     def train(self):
-        print("device: ", self.device)
         train_loss = []
         valid_rsme = []
 
@@ -116,6 +115,9 @@ class trainer():
             y_flat = y_np.reshape(-1)
             y_ones, y_min, y_max = measure.Norm(y_flat, dim=1)
             y_ones = y_ones.reshape(B, pre, N)
+
+            np.save("y_min.npy", y_min)
+            np.save("y_max.npy", y_max)
 
             hist_x = torch.tensor(x_ones, dtype=torch.float32)
             fore_y = torch.tensor(y_ones, dtype=torch.float32)

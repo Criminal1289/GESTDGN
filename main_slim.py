@@ -85,9 +85,9 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
     parser.add_argument('--feature', type=int, default=27, help='features used in prediction')
     parser.add_argument('--nodes', type=int, default=184, help='number of nodes')
-    parser.add_argument('--units', type=int, default=64, help='hidden units')
-    parser.add_argument('--his_len', type=int, default=6, help='input sequence length')
-    parser.add_argument('--pre_len', type=int, default=3, help='output sequence length')
+    parser.add_argument('--units', type=int, default=32, help='hidden units')
+    parser.add_argument('--his_len', type=int, default=4, help='input sequence length')
+    parser.add_argument('--pre_len', type=int, default=2, help='output sequence length')
 
     # graph files (we ONLY load existing adj set)
     parser.add_argument('--adj_Set', type=str, default='data/AdjSet(GE).npy',
