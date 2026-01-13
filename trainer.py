@@ -30,20 +30,21 @@ def TrainValidTest(x, y, train=0.8, valid=None, shuffle=True):
         return train_x, train_y, test_x, test_y
     else:
         valid_len = int(x.shape[0] * valid)
-        train_x = torch.tensor(x[:train_len], dtype=torch.float32)
-        train_y = torch.tensor(y[:train_len], dtype=torch.float32)
+        train_x = x[:train_len].clone().detach().float()
+        train_y = y[:train_len].clone().detach().float()
         _x = x[train_len:]
         _y = y[train_len:]
 
         if shuffle:
-            setup_seed(20)
-            np.random.shuffle(_x)
-            setup_seed(20)
-            np.random.shuffle(_y)
-        valid_x = torch.tensor(_x[:train_len+valid_len], dtype=torch.float32)
-        valid_y = torch.tensor(_y[:train_len+valid_len], dtype=torch.float32)
-        test_x = torch.tensor(x[train_len+valid_len:], dtype=torch.float32)
-        test_y = torch.tensor(y[train_len+valid_len:], dtype=torch.float32)
+            if shuffle:
+                setup_seed(20)
+                idx = torch.randperm(_x.shape[0])
+                _x = _x[idx]
+                _y = _y[idx]
+        valid_x = _x[:train_len + valid_len].clone().detach().float()
+        valid_y = _y[:train_len + valid_len].clone().detach().float()
+        test_x = x[train_len + valid_len:].clone().detach().float()
+        test_y = y[train_len + valid_len:].clone().detach().float()
         return train_x, train_y, valid_x, valid_y, test_x, test_y
 
 def Divide(x, y, his_step, pre_step):
@@ -96,13 +97,45 @@ class trainer():
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.decay)
 
-        x_ones, x_min, x_max = measure.Norm(np.array(torch.tensor(self.x).view(-1, feature_num), dtype=float), dim=2)
-        y_ones, y_min, y_max = measure.Norm(np.array(torch.tensor(self.y).view(-1), dtype=float), dim=1)
+        # ===============================
+        # NEW: 支持两种数据范式
+        # ===============================
+        if self.x.ndim == 4:
+            # 新范式：x=(B,his,N,F), y=(B,pre,N)
+            x_np = self.x
+            y_np = self.y
 
-        source_x = torch.tensor(x_ones).view(-1, nodes, feature_num)
-        source_y = torch.tensor(y_ones).view(-1, nodes)
+            B, his, N, F = x_np.shape
+            pre = y_np.shape[1]
 
-        hist_x, fore_y = Divide(source_x, source_y, self.his, self.pre)
+            # normalization（按 feature 维）
+            x_flat = x_np.reshape(-1, F)
+            x_ones, x_min, x_max = measure.Norm(x_flat, dim=2)
+            x_ones = x_ones.reshape(B, his, N, F)
+
+            y_flat = y_np.reshape(-1)
+            y_ones, y_min, y_max = measure.Norm(y_flat, dim=1)
+            y_ones = y_ones.reshape(B, pre, N)
+
+            hist_x = torch.tensor(x_ones, dtype=torch.float32)
+            fore_y = torch.tensor(y_ones, dtype=torch.float32)
+
+        else:
+            # 旧范式：x=(T,N,F), y=(T,N)
+            x_ones, x_min, x_max = measure.Norm(
+                np.array(torch.tensor(self.x).view(-1, feature_num), dtype=float),
+                dim=2
+            )
+            y_ones, y_min, y_max = measure.Norm(
+                np.array(torch.tensor(self.y).view(-1), dtype=float),
+                dim=1
+            )
+
+            source_x = torch.tensor(x_ones).view(-1, nodes, feature_num)
+            source_y = torch.tensor(y_ones).view(-1, nodes)
+
+            hist_x, fore_y = Divide(source_x, source_y, self.his, self.pre)
+
         train_x, train_y, valid_x, valid_y, test_x, test_y = TrainValidTest(hist_x, fore_y, train=self.trainset, valid=0.05)
 
         setup_seed(20)
@@ -115,7 +148,10 @@ class trainer():
                 inputs = inputs.to(self.device)
                 target = target.to(self.device)
 
-                y_hat = self.model(inputs)
+                # target: (B, pre, N) -> (B, N, pre) 以匹配模型输出
+                target = target.permute(0, 2, 1).contiguous()
+
+                y_hat = self.model(inputs)  # (B, N, pre)
                 loss = criterion(y_hat, target)
                 optimizer.zero_grad()
                 loss.backward()
@@ -130,6 +166,7 @@ class trainer():
 
                     self.model.eval()
                     valid_outputs = self.model(valid_x)
+                    valid_outputs = valid_outputs.permute(0, 2, 1).contiguous()
 
                     valid_outputs = valid_outputs.detach().cpu()
                     valid_outputs = valid_outputs * (y_max - y_min) + y_min
@@ -151,6 +188,7 @@ class trainer():
             test_x = test_x.to(self.device)
 
             test_outputs = self.model(test_x)
+            test_outputs = test_outputs.permute(0, 2, 1).contiguous()
             test_outputs = test_outputs.detach().cpu()
             test_outputs = test_outputs.cpu()
             test_y = test_y * (y_max - y_min) + y_min

@@ -2,13 +2,19 @@ import os, glob, re, math
 import numpy as np
 
 # ====== 你需要改的 1 个地方：cp 文件夹们的上级目录 ======
-cp_root = r"../GE-STDGN-main/data/BJ"   # 例如：r"D:\datasets\cp_all"
+cp_root = r"../gestdgn/data/BJ"   # 例如：r"D:\datasets\cp_all"
 
-# 8 个特征 + 1 个标签 = 9 维（要和 main.py 的 --feature=9 对齐）
-nwp_vars = ["CAPE","DVG850","DVG925","HT0","HT10","KI","PWAT","RH500"]
+# 手动指定 NWP 中所有特征和标签
+nwp_vars = [
+    "CAPE", "DVG200", "DVG850", "DVG925", "HT0", "HT10", "HTw0", "KI",
+    "LCL", "LFC", "LI300", "LI500", "muLCL", "PE", "PWAT", "Q1000", "Q700",
+    "Q850", "RH1000", "RH500", "RH700", "TdSfc850", "TTdMax74", "TTdMean74",
+    "WS500", "WS700", "WS925"  # RA作为标签添加
+]
+
+# 标签变量
 label_var = "RA"
 
-TARGET_T = 5848
 N_NODES = 184
 GRID_HW = 167
 
@@ -19,19 +25,20 @@ def time_key(fname: str):
     return m.group(1) if m else None
 
 def resize_nn(src2d: np.ndarray, out_h: int, out_w: int):
-    h,w = src2d.shape
+    h, w = src2d.shape
     ys = (np.linspace(0, h-1, out_h)).astype(int)
     xs = (np.linspace(0, w-1, out_w)).astype(int)
     return src2d[np.ix_(ys, xs)]
 
 def sample_at_nodes(grid2d: np.ndarray, node_idx: np.ndarray):
-    return grid2d[node_idx[:,0], node_idx[:,1]].astype(np.float32)
+    return grid2d[node_idx[:, 0], node_idx[:, 1]].astype(np.float32)
 
 # 184 个节点：从 167×167 均匀取 14×14=196 个，再取前 184
-idx = np.linspace(0, GRID_HW-1, 14, dtype=int)
-node_idx = np.array([(i,j) for i in idx for j in idx], dtype=int)[:N_NODES]
+idx = np.linspace(0, GRID_HW - 1, 14, dtype=int)
+node_idx = np.array([(i, j) for i in idx for j in idx], dtype=int)[:N_NODES]
 
-all_blocks = []
+# 存储所有patch数据
+all_patches = []
 
 cp_folders = sorted([p for p in glob.glob(os.path.join(cp_root, "*")) if os.path.isdir(p)])
 if not cp_folders:
@@ -69,8 +76,8 @@ for cp in cp_folders:
         continue
 
     T = len(common)
-    F = len(nwp_vars) + 1
-    block = np.zeros((T, N_NODES, F), dtype=np.float32)
+    F = len(nwp_vars) + 1  # 标签包含在内
+    patch = np.zeros((T, N_NODES, F), dtype=np.float32)
 
     for ti, tk in enumerate(common):
         # features
@@ -78,25 +85,20 @@ for cp in cp_folders:
             g = np.load(nwp_map[v][tk])
             if g.shape != (GRID_HW, GRID_HW):
                 g = resize_nn(g, GRID_HW, GRID_HW)
-            block[ti, :, fi] = sample_at_nodes(g, node_idx)
+            patch[ti, :, fi] = sample_at_nodes(g, node_idx)
 
         # label
         y = np.load(lab_map[tk])
         if y.shape != (GRID_HW, GRID_HW):
             y = resize_nn(y, GRID_HW, GRID_HW)
-        block[ti, :, -1] = sample_at_nodes(y, node_idx)
+        patch[ti, :, -1] = sample_at_nodes(y, node_idx)
 
-    all_blocks.append(block)
-    print(f"[OK] {os.path.basename(cp)} -> {block.shape}")
+    all_patches.append(patch)
+    print(f"[OK] {os.path.basename(cp)} -> {patch.shape}")
 
-dataset = np.concatenate(all_blocks, axis=0)
-if dataset.shape[0] < TARGET_T:
-    rep = math.ceil(TARGET_T / dataset.shape[0])
-    dataset = np.tile(dataset, (rep, 1, 1))[:TARGET_T]
-else:
-    dataset = dataset[:TARGET_T]
-
-out_path = os.path.join("data", "DataSet.npy")  # 放到 GE-STDGN-main/data/
-os.makedirs("data", exist_ok=True)
-np.save(out_path, dataset)
-print("Saved:", out_path, dataset.shape)
+# 这里不再将所有patch数据堆叠成一个大数据集，而是每个patch独立存储
+for i, patch in enumerate(all_patches):
+    out_path = os.path.join("data/patch", f"patch_{i}.npy")  # 保存每个patch为独立文件
+    os.makedirs("data", exist_ok=True)
+    np.save(out_path, patch)
+    print(f"Saved: {out_path}, Shape: {patch.shape}")
