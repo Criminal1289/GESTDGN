@@ -1,8 +1,9 @@
 import os, glob, re, math
 import numpy as np
+from make_knn_adj import *
 
 # ====== 你需要改的 1 个地方：cp 文件夹们的上级目录 ======
-cp_root = r"../gestdgn/data/BJ"   # 例如：r"D:\datasets\cp_all"
+cp_root = r"../gestdgn/data/BJ"  # 例如：r"D:\datasets\cp_all"
 
 # 手动指定 NWP 中所有特征和标签
 nwp_vars = [
@@ -18,25 +19,36 @@ label_var = "RA"
 N_NODES = 184
 GRID_HW = 167
 
+
 def time_key(fname: str):
     # 兼容 ..._0517-1600_xxx.npy 或 ..._0517-1600.npy
     b = os.path.basename(fname)
     m = re.search(r"_(\d{4}-\d{4})(?:_|\.npy)", b)
     return m.group(1) if m else None
 
+
 def resize_nn(src2d: np.ndarray, out_h: int, out_w: int):
     h, w = src2d.shape
-    ys = (np.linspace(0, h-1, out_h)).astype(int)
-    xs = (np.linspace(0, w-1, out_w)).astype(int)
+    ys = (np.linspace(0, h - 1, out_h)).astype(int)
+    xs = (np.linspace(0, w - 1, out_w)).astype(int)
     return src2d[np.ix_(ys, xs)]
+
 
 def sample_at_nodes(grid2d: np.ndarray, node_idx: np.ndarray):
     return grid2d[node_idx[:, 0], node_idx[:, 1]].astype(np.float32)
+
 
 # 184 个节点：从 167×167 均匀取 14×14=196 个，再取前 184
 idx = np.linspace(0, GRID_HW - 1, 14, dtype=int)
 node_idx = np.array([(i, j) for i in idx for j in idx], dtype=int)[:N_NODES]
 
+# 保存knn使用的坐标信息
+np.save(r"../gestdgn/data/coords.npy", node_idx.astype(np.float32))
+print("save coords:", node_idx.shape)
+coords = np.load(r"../gestdgn/data/coords.npy")
+A = build_knn_adj(coords, k=8, mode="binary")
+np.save(r"../gestdgn/data/adj_knn.npy", A)
+print(f"row:{coords[55]}")
 # 存储所有patch数据
 all_patches = []
 
