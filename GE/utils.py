@@ -32,7 +32,7 @@ class NSGA2Utils(object):
         if index is not None:
             self.lens = len(index)
         if index_group is not None:
-            self.station_pro = np.load('../GE-STDGN-main/data/station_pro.npy')
+            self.station_pro = np.load(r'../gestdgn/data/station_pro.npy')
             self.lens = len(self.station_pro)
             print(self.lens)
         else:
@@ -120,18 +120,18 @@ class NSGA2Utils(object):
         else:
             return -1
 
-    def create_initial_population(self, other_adj=None):
+    def create_initial_population(self, other_adj=None, his_len=None, pre_len=None):
         pop = Population()
         if self.index_group is not None:
             start = self.index_group[0]
             end = self.index_group[1]
             self.pop_num = end - start + 1
-            max_edge = np.load('../GE-STDGN-main/data/index_' + str(end) + '.npy')
+            max_edge = np.load(r'../gestdgn/data/index_' + str(end) + '.npy')
             self.max_index = max_edge
             #self.edge_index = max_edge
             while start <= end:
                 individual = Individual()
-                thisindex = np.load('../GE-STDGN-main/data/index_' + str(start) + '.npy')
+                thisindex = np.load(r'../gestdgn/data/index_' + str(start) + '.npy')
                 initials = np.zeros(self.lens)
                 j = 0
                 for i in range(self.lens):
@@ -173,7 +173,7 @@ class NSGA2Utils(object):
                     if i % 5 == 0:
                         print(f"[init fitness] {i}/{len(pop.population)}", flush=True)
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    R.append(self.calculate_objectives(ind, device))
+                    R.append(self.calculate_objectives(ind, device, his_len, pre_len))
                 pop.population = R
 
             end = time.time()
@@ -181,7 +181,7 @@ class NSGA2Utils(object):
             print('initialization over!')
             return pop
 
-    def calculate_objectives(self, individual, device):
+    def calculate_objectives(self, individual, device, his_len, pre_len):
         adj_i = individual.index_to_matrix()
         #torch
         #adj_i = torch.tensor(adj_i + np.eye(self.matrix_size), dtype=torch.float32)
@@ -189,14 +189,14 @@ class NSGA2Utils(object):
         adj_i = adj_i + np.eye(self.matrix_size)
         sparse = individual.get_sparse()
         #适应度函数，主要计算矩阵精确度
-        fit, model = fitness_cal(adjmat=adj_i, device=device)
+        fit, model = fitness_cal(adjmat=adj_i, device=device,his_len=his_len,pre_len=pre_len)
         #fit, model, device = OtherFitness(adj_i, device)
         #print(fit, sparse)
         individual.model_parameter = model.state_dict()
         individual.objectives = [fit, sparse]
         return individual
 
-    def create_children(self, population):
+    def create_children(self, population,his_len,pre_len):
         # ====== 兜底：种群太小，无法做交叉 ======
         if population is None or len(population) < 2:
             print("[WARN] population < 2, skip crossover.")
@@ -232,7 +232,7 @@ class NSGA2Utils(object):
             for i, ind in enumerate(children):
                 if i % 5 == 0:
                     print(f"[children fitness] {i}/{len(children)}", flush=True)
-                R.append(self.calculate_objectives(ind, self.device))
+                R.append(self.calculate_objectives(ind, self.device,his_len,pre_len))
             children = R
 
         end = time.time()

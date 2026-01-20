@@ -41,10 +41,10 @@ def TrainValidTest(x, y, train=0.8, valid=None, shuffle=True):
                 idx = torch.randperm(_x.shape[0])
                 _x = _x[idx]
                 _y = _y[idx]
-        valid_x = _x[:train_len + valid_len].clone().detach().float()
-        valid_y = _y[:train_len + valid_len].clone().detach().float()
-        test_x = x[train_len + valid_len:].clone().detach().float()
-        test_y = y[train_len + valid_len:].clone().detach().float()
+        valid_x = _x[:valid_len].clone().detach().float()
+        valid_y = _y[:valid_len].clone().detach().float()
+        test_x = _x[valid_len:].clone().detach().float()
+        test_y = _y[valid_len:].clone().detach().float()
         return train_x, train_y, valid_x, valid_y, test_x, test_y
 
 def Divide(x, y, his_step, pre_step):
@@ -112,15 +112,44 @@ class trainer():
             x_ones, x_min, x_max = measure.Norm(x_flat, dim=2)
             x_ones = x_ones.reshape(B, his, N, F)
 
-            y_flat = y_np.reshape(-1)
-            y_ones, y_min, y_max = measure.Norm(y_flat, dim=1)
-            y_ones = y_ones.reshape(B, pre, N)
+            NULL_VAL = -9.0
 
-            np.save("y_min.npy", y_min)
-            np.save("y_max.npy", y_max)
+            y_flat = y_np.reshape(-1).astype(np.float32)
+            valid = (y_flat != NULL_VAL)
+
+            # 对有效降水做裁剪：负值当 0（降水物理意义）
+            y_valid = np.clip(y_flat[valid], 0.0, None)
+
+            # log1p 变换（增强尾部）
+            y_log_valid = np.log1p(y_valid)
+
+            # 用有效值计算 min/max（在 log 空间）
+            y_log_min = float(y_log_valid.min())
+            y_log_max = float(y_log_valid.max())
+            y_log_range = y_log_max - y_log_min + 1e-8
+
+            # 归一化到 [0,1]（仍在 log 空间）
+            y_norm = np.zeros_like(y_flat, dtype=np.float32)
+            y_norm[valid] = (y_log_valid - y_log_min) / y_log_range
+
+            # 缺测位置给 0（不会参与 loss/metric，因为我们会 mask）
+            y_norm[~valid] = 0.0
+
+            y_ones = y_norm.reshape(B, pre, N)
+
+            # 保存可逆参数（注意：这是 log 空间的 min/max）
+            np.save("y_log_min.npy", np.array(y_log_min, dtype=np.float32))
+            np.save("y_log_max.npy", np.array(y_log_max, dtype=np.float32))
+            np.save("y_null_val.npy", np.array(NULL_VAL, dtype=np.float32))
 
             hist_x = torch.tensor(x_ones, dtype=torch.float32)
-            fore_y = torch.tensor(y_ones, dtype=torch.float32)
+
+            y_mask = valid.reshape(B, pre, N).astype(np.float32)  # 1=有效,0=缺测
+            y_mask = torch.tensor(y_mask, dtype=torch.float32)
+
+            fore_y_val = torch.tensor(y_ones, dtype=torch.float32)  # (B, pre, N)
+            fore_y = torch.stack([fore_y_val, y_mask], dim=-1)  # (B, pre, N, 2)
+
 
         else:
             # 旧范式：x=(T,N,F), y=(T,N)
@@ -140,21 +169,53 @@ class trainer():
 
         train_x, train_y, valid_x, valid_y, test_x, test_y = TrainValidTest(hist_x, fore_y, train=self.trainset, valid=0.05)
 
+        # ===== log1p inverse 参数（只加载一次）=====
+        y_log_min = float(np.load("y_log_min.npy"))
+        y_log_max = float(np.load("y_log_max.npy"))
+        y_log_range = y_log_max - y_log_min + 1e-8
+
+        def inv_y(y_norm):
+            """
+            y_norm: torch.Tensor, log-space normalized in [0,1]
+            return: mm
+            """
+            y_log = y_norm * y_log_range + y_log_min
+            return torch.expm1(y_log)
+
         setup_seed(20)
         train_loader = DataLoader(dataset=TensorDataset(train_x, train_y), batch_size=self.batch, shuffle=True)
 
-        Valid_y = valid_y * (y_max - y_min) + y_min
+        valid_y_val = valid_y[..., 0] if (valid_y.ndim == 4 and valid_y.shape[-1] == 2) else valid_y
+        Valid_y = inv_y(valid_y_val.cpu())
+
         for e in range(self.epoch):
             for i, data in enumerate(train_loader):
-                inputs, target = data
+                inputs, target_pack = data
                 inputs = inputs.to(self.device)
-                target = target.to(self.device)
+                target_pack = target_pack.to(self.device)  # (B, pre, N, 2)
 
-                # target: (B, pre, N) -> (B, N, pre) 以匹配模型输出
-                target = target.permute(0, 2, 1).contiguous()
+                target = target_pack[..., 0]  # y_norm
+                mask = target_pack[..., 1]  # 1 valid
 
-                y_hat = self.model(inputs)  # (B, N, pre)
-                loss = criterion(y_hat, target)
+                target = target.permute(0, 2, 1).contiguous()  # (B, N, pre)
+                mask = mask.permute(0, 2, 1).contiguous()
+
+                y_hat = self.model(inputs)
+
+                diff2 = (y_hat - target) ** 2
+
+                with torch.no_grad():
+                    # 把 target 从 log-norm 还原到 mm，用来判阈值
+                    target_mm = torch.expm1(target * y_log_range + y_log_min)
+
+                # 权重：小雨=1，中雨/大雨逐级放大
+                w = torch.ones_like(target_mm)
+                w = w + 1.0 * (target_mm >= 1.0).float()
+                w = w + 3.0 * (target_mm >= 5.0).float()
+                w = w + 6.0 * (target_mm >= 10.0).float()
+
+                loss = (diff2 * w * mask).sum() / ((w * mask).sum() + 1e-8)
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -171,15 +232,15 @@ class trainer():
                     valid_outputs = valid_outputs.permute(0, 2, 1).contiguous()
 
                     valid_outputs = valid_outputs.detach().cpu()
-                    valid_outputs = valid_outputs * (y_max - y_min) + y_min
+                    valid_outputs_mm = inv_y(valid_outputs)
+                    rmse = measure.GetRMSE(valid_outputs_mm, Valid_y)
 
-                    rmse = measure.GetRMSE(valid_outputs, Valid_y)
                     valid_rsme.append(rmse)
                     print("valid RMSE:", rmse)
                     self.model.train()
         model_name = self.model.__class__.__name__
-        np.save("valid_RSME" + model_name+'.npy', np.array(valid_rsme))
-        np.save("train_Loss" + model_name+'.npy', np.array(train_loss))
+        np.save("valid_RSME_" + model_name+'.npy', np.array(valid_rsme))
+        np.save("train_Loss_" + model_name+'.npy', np.array(train_loss))
 
         if self.valid is not None:
             print('valid result: ', rmse)
@@ -193,16 +254,11 @@ class trainer():
             test_outputs = test_outputs.permute(0, 2, 1).contiguous()
             test_outputs = test_outputs.detach().cpu()
             test_outputs = test_outputs.cpu()
-            test_y = test_y * (y_max - y_min) + y_min
-            test_outputs = test_outputs * (y_max - y_min) + y_min
-            rmse = measure.GetRMSE(test_y, test_outputs)
-            # mae = Measure.GetMAP(test_y, test_outputs)
-            # mape = Measure.GetMAPE(test_y, test_outputs)
-            # r2 = Measure.R_square(test_y, test_outputs)
+            test_y_val = test_y[..., 0] if (test_y.ndim == 4 and test_y.shape[-1] == 2) else test_y
+            test_y_mm = inv_y(test_y_val.cpu())
+
+            test_outputs_mm = inv_y(test_outputs.cpu())
+            rmse = measure.GetRMSE(test_y_mm, test_outputs_mm)
             print("RMSE:", rmse)
-            # print("MAE:", mae)
-            # print("MAPE:", mape)
-            # print("R2:", r2)
-            # print(train_loss)
-            # print(valid_rsme)
+
         return rmse, self.model.cpu()

@@ -46,6 +46,7 @@ node_idx = np.array([(i, j) for i in idx for j in idx], dtype=int)[:N_NODES]
 np.save(r"../gestdgn/data/coords.npy", node_idx.astype(np.float32))
 print("save coords:", node_idx.shape)
 coords = np.load(r"../gestdgn/data/coords.npy")
+print("coords shape:", coords.shape)
 A = build_knn_adj(coords, k=8, mode="binary")
 np.save(r"../gestdgn/data/adj_knn.npy", A)
 print(f"row:{coords[55]}")

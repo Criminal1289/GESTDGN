@@ -85,9 +85,9 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
     parser.add_argument('--feature', type=int, default=27, help='features used in prediction')
     parser.add_argument('--nodes', type=int, default=184, help='number of nodes')
-    parser.add_argument('--units', type=int, default=64, help='hidden units')
     parser.add_argument('--his_len', type=int, default=4, help='input sequence length')
     parser.add_argument('--pre_len', type=int, default=2, help='output sequence length')
+    parser.add_argument('--units', type=int, default=64, help='hidden units')
 
     # graph files (we ONLY load existing adj set)
     parser.add_argument('--adj_Set', type=str, default='data/AdjSet(GE).npy',
@@ -102,6 +102,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100, help='epochs')
     parser.add_argument('--optim', type=str, default='adam')
     parser.add_argument('--device', type=str, default='cuda:0', help='cuda:0 / cpu')
+    parser.add_argument('--ablation', type=str, default='knn', help='baseline,knn,ge')
 
     args = parser.parse_args()
     device = get_device(args.device)
@@ -126,7 +127,14 @@ def main():
         raise ValueError(f"feature mismatch: DataSet F={x.shape[3]} but args.feature={args.feature}")
 
     # ---- load adjacency ----
-    adj_set = np.load(args.adj_Set)
+    if args.ablation == "ge":
+        adj_set = np.load(args.adj_Set)
+    elif args.ablation == "knn":
+        adj_set = np.load(r"../gestdgn/data/adj_knn.npy")
+        adj_set = adj_set[None, :, :]
+    else:
+        adj_set = np.load(args.adj_Set)
+
     if adj_set.ndim != 3:
         raise ValueError(f"AdjSet must be 3D (K,N,N), got shape={adj_set.shape}")
 

@@ -4,10 +4,11 @@ import numpy as np
 import torch
 import functools
 
+
 class Evolution(object):
     # 如果有精英保留机制，就直接去重
     def __init__(self, pop=50, iter=30, cross_pro=0.8, mutation_pro=0.2, matrix_size=184, tourna_size=5, index=None,
-                 index_group=None):
+                 index_group=None, his_len=None, pre_len=None):
         self.utils = NSGA2Utils(pop=pop, iter=iter, cross_pro=cross_pro, mutation_pro=mutation_pro,
                                 matrix_size=matrix_size,
                                 tourna_size=tourna_size, index=index, index_group=index_group)
@@ -16,18 +17,22 @@ class Evolution(object):
         self.num_of_generations = iter
         self.on_generation_finished = []
         self.history = []
+        self.his_len = his_len
+        self.pre_len = pre_len
 
     def register_on_new_generation(self, fun):
         self.on_generation_finished.append(fun)
 
     def evolve(self, other_adj=None):
-        self.population = self.utils.create_initial_population(other_adj=other_adj)
+        self.population = self.utils.create_initial_population(other_adj=other_adj, his_len=self.his_len,
+                                                               pre_len=self.pre_len)
         self.num_of_individuals = len(self.population)
         self.utils.fast_nondominated_sort(self.population)
         for front in self.population.fronts:
             self.utils.calculate_crowding_distance(front)
         # children = self.utils.create_initial_population()
-        children = self.utils.create_children(self.population.population)
+        children = self.utils.create_children(self.population.population,his_len=self.his_len,
+                                                               pre_len=self.pre_len)
         print(len(children))
         returned_population = None
         for i in range(self.num_of_generations):
@@ -47,7 +52,8 @@ class Evolution(object):
             returned_population = self.population
             self.population = new_population
             print('children:')
-            children = self.utils.create_children(self.population.population)
+            children = self.utils.create_children(self.population.population,his_len=self.his_len,
+                                                               pre_len=self.pre_len)
             print('-----------------------------------------over-------------------------------------------')
             for fun in self.on_generation_finished:
                 value, his = fun(returned_population, i)

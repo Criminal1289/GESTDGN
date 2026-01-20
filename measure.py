@@ -2,32 +2,55 @@
 # -*- coding:utf-8 -*-
 import numpy as np
 import torch
-def GetRMSE(y, y_hat):
-    y = torch.flatten(y)
-    y_hat = torch.flatten(y_hat)
-    RMSE = (y - y_hat) ** 2
-    RMSE = torch.flatten(RMSE)
-    RMSE = sum(RMSE)/len(RMSE)
-    RMSE = RMSE ** (1/2)
-    #print('fun: GetRMSE')
-    RMSE = RMSE.detach().numpy()
-    return RMSE
 
-def GetMAP(y, y_hat):
-    y = torch.flatten(y)
-    y_hat = torch.flatten(y_hat)
-    MAP = torch.abs((y - y_hat))
-    MAP = sum(MAP)/len(MAP)
-    MAP = MAP.detach().numpy()
-    return MAP
+NULL_VAL = -9.0
 
-def GetMAPE(y, y_hat):
-    y = torch.flatten(y)
-    y_hat = torch.flatten(y_hat)
-    MAPE = torch.abs((y - y_hat)/y)
-    MAPE = sum(MAPE) / len(MAPE)
-    MAPE = MAPE.detach().numpy()
-    return MAPE
+
+def _to_numpy(a):
+    if isinstance(a, np.ndarray):
+        return a
+    return a.detach().cpu().numpy()
+
+
+def _valid_mask(y, null_val=NULL_VAL):
+    y = _to_numpy(y).reshape(-1)
+    return (y != null_val)
+
+
+def GetRMSE(y, y_hat, null_val=NULL_VAL):
+    y = _to_numpy(y).reshape(-1)
+    y_hat = _to_numpy(y_hat).reshape(-1)
+
+    m = (y != null_val)
+    if m.sum() == 0:
+        return np.nan
+
+    diff2 = (y[m] - y_hat[m]) ** 2
+    return float(np.sqrt(diff2.mean()))
+
+
+def GetMAP(y, y_hat, null_val=NULL_VAL):
+    y = _to_numpy(y).reshape(-1)
+    y_hat = _to_numpy(y_hat).reshape(-1)
+
+    m = (y != null_val)
+    if m.sum() == 0:
+        return np.nan
+
+    return float(np.abs(y[m] - y_hat[m]).mean())
+
+
+def GetMAPE(y, y_hat, null_val=NULL_VAL, eps=1e-6):
+    y = _to_numpy(y).reshape(-1)
+    y_hat = _to_numpy(y_hat).reshape(-1)
+
+    m = (y != null_val)
+    if m.sum() == 0:
+        return np.nan
+
+    denom = np.maximum(np.abs(y[m]), eps)
+    return float(np.abs((y[m] - y_hat[m]) / denom).mean())
+
 
 def R_square(y, y_hat):
     if type(y) is not np.ndarray:
@@ -37,6 +60,7 @@ def R_square(y, y_hat):
     mean = np.mean(y)
     r = 1 - np.sum((y - y_hat) ** 2) / np.sum((y - mean) ** 2)
     return r
+
 
 def Skill(y, y_hat):
     if type(y) is not np.ndarray:
@@ -53,43 +77,40 @@ def Skill(y, y_hat):
     similarity = sum(count) / y.shape[0]
     return similarity
 
-def Norm(DataSet, dim=2, Range=[0, 1]):
 
+def Norm(DataSet, dim=2, Range=[0, 1]):
     range_ones = Range[1] - Range[0]
     DataSet_min = np.min(DataSet, axis=0)
     DataSet_max = np.max(DataSet, axis=0)
-    #print(DataSet_min)
-    #print(DataSet_max)
+    # print(DataSet_min)
+    # print(DataSet_max)
     if dim == 2:
         for i in range(DataSet.shape[1]):
             DataSet[:, i] = (DataSet[:, i] - DataSet_min[i]) / (DataSet_max[i] - DataSet_min[i]) * range_ones + Range[0]
     else:
         DataSet = (DataSet - DataSet_min) / (DataSet_max - DataSet_min) * range_ones + Range[0]
-    #DataSet = (DataSet - DataSet_min) / (DataSet_max - DataSet_min)
-    #DataSet = torch.tensor(DataSet)
+    # DataSet = (DataSet - DataSet_min) / (DataSet_max - DataSet_min)
+    # DataSet = torch.tensor(DataSet)
     return DataSet, DataSet_min, DataSet_max
+
+
 # ================== Rainfall categorical metrics ==================
 
-def _confusion_counts(y, y_hat, thr=0.1):
-    """
-    Calculate H, M, F, C for rainfall detection.
-    y, y_hat: torch.Tensor or np.ndarray, 任意形状
-    thr: rainfall threshold (same unit as y)
-    """
-    if not isinstance(y, np.ndarray):
-        y = y.detach().cpu().numpy()
-    if not isinstance(y_hat, np.ndarray):
-        y_hat = y_hat.detach().cpu().numpy()
+def _confusion_counts(y, y_hat, thr=0.1, null_val=NULL_VAL):
+    y = _to_numpy(y).reshape(-1)
+    y_hat = _to_numpy(y_hat).reshape(-1)
 
-    y = y.reshape(-1)
-    y_hat = y_hat.reshape(-1)
+    # 忽略缺测
+    m = (y != null_val)
+    y = y[m]
+    y_hat = y_hat[m]
 
     obs = y >= thr
     pre = y_hat >= thr
 
-    H = np.sum(obs & pre)        # Hit
-    M = np.sum(obs & (~pre))     # Miss
-    F = np.sum((~obs) & pre)     # False Alarm
+    H = np.sum(obs & pre)  # Hit
+    M = np.sum(obs & (~pre))  # Miss
+    F = np.sum((~obs) & pre)  # False Alarm
     C = np.sum((~obs) & (~pre))  # Correct Negative
 
     return H, M, F, C
