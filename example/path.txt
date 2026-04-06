@@ -1,0 +1,2 @@
+SAMPLE_DIR = r"C:/Users/17878/Desktop/gestdgn/data/cnn_spatial_align_slide"
+ADJ_PATH = r"C:/Users/17878/Desktop/gestdgn/data/AdjSet(GE).npy"

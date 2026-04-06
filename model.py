@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import math
 from torch.nn import Parameter
+from cnn.cnn_frontend import CNNFrontEnd
 
 cuda_gpu = torch.cuda.is_available()
 
@@ -137,6 +138,7 @@ class STDGN_woa(nn.Module):
         self.drop = nn.Dropout(0.2)
         #self.sigmoid = nn.Sigmoid()
         self.pre_linear = nn.Linear(num_units, pre_len)
+        self.cls_head = nn.Linear(num_units, pre_len)
 
     def forward(self, x):
         #x = [batchsize, nodes, seq_len, feature]
@@ -153,10 +155,15 @@ class STDGN_woa(nn.Module):
                 x, h = self.dgncell(input[:, :, i, :], h)
             seq_list.append(x)
         #last_list = [batch_size * nodes, hidden]
-        last_list = seq_list[-1]
-        output = self.pre_linear(last_list)
-        output = output.view(batch_size, self.nodes, -1)
-        return output
+        last_list = seq_list[-1]  # [B, N, H]
+
+        y_hat = F.softplus(self.pre_linear(last_list))  # 回归：非负
+        logit_rain = self.cls_head(last_list)  # 分类：logits
+
+        y_hat = y_hat.view(batch_size, self.nodes, -1)
+        logit_rain = logit_rain.view(batch_size, self.nodes, -1)
+
+        return y_hat, logit_rain
 
 class STDGN(nn.Module):
     name = "STDGN"
@@ -171,8 +178,12 @@ class STDGN(nn.Module):
 
 
         # multi-head attention
-        self.attn = [AttEncoderLayer(num_units, seq_len, device) for _ in range(num_head)]
-        self.attn_combine = nn.Linear(2*num_units, pre_len)
+        self.attn = nn.ModuleList([AttEncoderLayer(num_units, seq_len, device) for _ in range(num_head)])
+
+        # self.attn_combine = nn.Linear(2*num_units, pre_len)
+        self.reg_head = nn.Linear(2 * num_units, pre_len)
+        # 分类头：预测是否下雨（logits，后面用 sigmoid 得到概率）
+        self.cls_head = nn.Linear(2 * num_units, pre_len)
 
         self.dgncell = DGNCell(num_units, adj, num_nodes, device, deep)
         self.seq_linear = nn.Linear(num_feature, num_units)
@@ -182,14 +193,14 @@ class STDGN(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        #attn_weight = self.attn.weight
-        #attn_bias = self.attn.bias
-        attn_c_weight = self.attn_combine.weight
-        attn_c_bias = self.attn_combine.bias
-        #torch.nn.init.xavier_uniform_(attn_weight, gain=1)
-        #torch.nn.init.constant_(attn_bias, 0)
-        torch.nn.init.xavier_uniform_(attn_c_weight, gain=1)
-        torch.nn.init.constant_(attn_c_bias, 0)
+        torch.nn.init.xavier_uniform_(self.reg_head.weight, gain=1)
+        torch.nn.init.constant_(self.reg_head.bias, 0)
+
+        torch.nn.init.xavier_uniform_(self.cls_head.weight, gain=1)
+        torch.nn.init.constant_(self.cls_head.bias, 0)
+
+        for att in self.attn:
+            att.reset_parameters()
 
     def forward(self, x):
         # x = [batchsize, nodes, seq_len, feature]
@@ -215,9 +226,13 @@ class STDGN(nn.Module):
 
         # concat multi-head attention
         # attn_applied = torch.cat([att(seq_list) for att in self.attn], dim=2)
-        output = torch.cat((seq_list[:, :, -1, :], attn_applied), dim=2).view(batch_size * self.nodes, -1)
-        output = self.attn_combine(output).view(batch_size, self.nodes, -1)
-        return output
+        feat = torch.cat((seq_list[:, :, -1, :], attn_applied), dim=2)  # [B, N, 2H]
+        feat2 = feat.view(batch_size * self.nodes, -1)  # [B*N, 2H]
+
+        y_hat = F.softplus(self.reg_head(feat2)).view(batch_size, self.nodes, -1)  # [B, N, pre_len] 非负回归
+        logit_rain = self.cls_head(feat2).view(batch_size, self.nodes, -1)  # [B, N, pre_len] 分类logits
+
+        return y_hat, logit_rain
 
 # ------------------------------------------- other graph cell used in processing spatial relation _________________________________________
 

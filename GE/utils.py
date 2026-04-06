@@ -21,7 +21,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class NSGA2Utils(object):
 
-    def __init__(self, pop=30, iter=30, cross_pro=0.7, mutation_pro=0.05, matrix_size=184, tourna_size=5, index=None, index_group=None):
+    def __init__(self, pop=30, iter=30, cross_pro=0.7, mutation_pro=0.05, matrix_size=1024, tourna_size=5, index=None, index_group=None):
         self.pop_num = pop
         self.iter_num = iter
         self.cross_pro = cross_pro
@@ -32,7 +32,8 @@ class NSGA2Utils(object):
         if index is not None:
             self.lens = len(index)
         if index_group is not None:
-            self.station_pro = np.load(r'../gestdgn/data/station_pro.npy')
+            # 使用main_cnn的时候别忘改！！！
+            self.station_pro = np.load(r'../gestdgn/data/cnn_spatial_align_slide/station_pro.npy')
             self.lens = len(self.station_pro)
             print(self.lens)
         else:
@@ -126,12 +127,14 @@ class NSGA2Utils(object):
             start = self.index_group[0]
             end = self.index_group[1]
             self.pop_num = end - start + 1
-            max_edge = np.load(r'../gestdgn/data/index_' + str(end) + '.npy')
+            # !!!!!!!!!!!!!!!!!!!!!!!!
+            max_edge = np.load(r'../gestdgn/data/cnn_spatial_align_slide/index/index_' + str(end) + '.npy')
             self.max_index = max_edge
             #self.edge_index = max_edge
             while start <= end:
                 individual = Individual()
-                thisindex = np.load(r'../gestdgn/data/index_' + str(start) + '.npy')
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                thisindex = np.load(r'../gestdgn/data/cnn_spatial_align_slide/index/index_' + str(start) + '.npy')
                 initials = np.zeros(self.lens)
                 j = 0
                 for i in range(self.lens):

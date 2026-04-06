@@ -7,7 +7,7 @@ import functools
 
 class Evolution(object):
     # 如果有精英保留机制，就直接去重
-    def __init__(self, pop=50, iter=30, cross_pro=0.8, mutation_pro=0.2, matrix_size=184, tourna_size=5, index=None,
+    def __init__(self, pop=50, iter=30, cross_pro=0.8, mutation_pro=0.2, matrix_size=1024, tourna_size=5, index=None,
                  index_group=None, his_len=None, pre_len=None):
         self.utils = NSGA2Utils(pop=pop, iter=iter, cross_pro=cross_pro, mutation_pro=mutation_pro,
                                 matrix_size=matrix_size,

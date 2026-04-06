@@ -44,6 +44,10 @@ def preprocess_data(x, y, feature_num, seq_len, pre_len):
     source_y = torch.tensor(y_ones).view(-1, nodes)
 
     hist_x, fore_y = Divide(source_x, source_y, seq_len, pre_len)
+
+    # 确保返回的是 Tensor
+    hist_x = torch.tensor(hist_x, dtype=torch.float32)
+    fore_y = torch.tensor(fore_y, dtype=torch.float32)
     return TrainValidTest(hist_x, fore_y, valid=0.05)
     # train_x, train_y, test_x, test_y = Main.TrainValidTest(hist_x, fore_y)
 
@@ -196,7 +200,7 @@ def LSTM_forecast(train_x, train_y, valid_x, valid_y, test_x, test_y):
 
 
 if __name__ == "__main__":
-    dataset = np.load("../data/DataSet.npy")
+    dataset = np.load("../gestdgn/data/DataSet.npy")
     x = dataset[:5848, :, :]
     y = dataset[:5848, :, -1]
     train_x, train_y, valid_x, valid_y, test_x, test_y = preprocess_data(x, y, feature_num=9, seq_len=16, pre_len=8)
