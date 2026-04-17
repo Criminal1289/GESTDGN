@@ -92,24 +92,51 @@ def _inv_y(y_norm, y_log_min, y_log_range):
     return torch.clamp(y_mm, min=0.0)
 
 
-def _safe_print_cls_metrics(p_rain, event_true):
-    print("=== CLS metrics (from p_rain only) ===")
-    for p_thr_try in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]:
-        event_pred = (p_rain >= p_thr_try)
+# def _safe_print_cls_metrics(p_rain, event_true):
+#     print("=== CLS metrics (from p_rain only) ===")
+#     for p_thr_try in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]:
+#         event_pred = (p_rain >= p_thr_try)
+#
+#         TP = (event_pred & event_true).sum().item()
+#         FP = (event_pred & (~event_true)).sum().item()
+#         FN = ((~event_pred) & event_true).sum().item()
+#
+#         POD = TP / (TP + FN + 1e-6)
+#         FAR = FP / (TP + FP + 1e-6)
+#         CSI = TP / (TP + FP + FN + 1e-6)
+#
+#         print(
+#             f"[CLS thr=0.1] p_thr={p_thr_try:.2f} "
+#             f"POD={POD:.4f} FAR={FAR:.4f} CSI={CSI:.4f}"
+#         )
+def _safe_print_cls_metrics(p_rain, fore_y_mm):
+    print("=== CLS metrics ===")
 
-        TP = (event_pred & event_true).sum().item()
-        FP = (event_pred & (~event_true)).sum().item()
-        FN = ((~event_pred) & event_true).sum().item()
+    # 降雨量阈值：0.1~5 中选几个典型值
+    rain_thr_list = [0.1, 0.5, 1.0, 2.0, 5.0]
 
-        POD = TP / (TP + FN + 1e-6)
-        FAR = FP / (TP + FP + 1e-6)
-        CSI = TP / (TP + FP + FN + 1e-6)
+    # 固定概率阈值
+    p_thr_list = [0.4, 0.5, 0.6]
 
-        print(
-            f"[CLS thr=0.1] p_thr={p_thr_try:.2f} "
-            f"POD={POD:.4f} FAR={FAR:.4f} CSI={CSI:.4f}"
-        )
+    for rain_thr in rain_thr_list:
+        event_true = (fore_y_mm >= rain_thr)
 
+        print(f"\n--- Rainfall threshold = {rain_thr:.1f} mm ---")
+        for p_thr_try in p_thr_list:
+            event_pred = (p_rain >= p_thr_try)
+
+            TP = (event_pred & event_true).sum().item()
+            FP = (event_pred & (~event_true)).sum().item()
+            FN = ((~event_pred) & event_true).sum().item()
+
+            POD = TP / (TP + FN + 1e-6)
+            FAR = FP / (TP + FP + 1e-6)
+            CSI = TP / (TP + FP + FN + 1e-6)
+
+            print(
+                f"[rain_thr={rain_thr:.1f}mm, p_thr={p_thr_try:.1f}] "
+                f"POD={POD:.4f} FAR={FAR:.4f} CSI={CSI:.4f}"
+            )
 
 def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
     mask = torch.ones_like(fore_y_mm, dtype=torch.bool)
@@ -119,12 +146,12 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
     print("整体RMSE:", rmse)
     print("整体MAE:", mae)
 
-    event_true = (fore_y_mm >= 0.1)
+    # event_true = (fore_y_mm >= 0.1)
 
     print("pred min/mean/max:", outputs.min().item(), outputs.mean().item(), outputs.max().item())
     print("true min/mean/max:", fore_y_mm.min().item(), fore_y_mm.mean().item(), fore_y_mm.max().item())
 
-    _safe_print_cls_metrics(p_rain, event_true)
+    _safe_print_cls_metrics(p_rain, fore_y_mm)
 
     for i in range(pre_step):
         print('step ', i)

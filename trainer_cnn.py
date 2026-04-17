@@ -1,8 +1,11 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
 import numpy as np
 import measure
 import torch.nn.functional as Fu
+from draw_plot_rain import plot_rainy_session
 
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -436,6 +439,23 @@ class trainer():
 
             print("RMSE(GATED all):", rmse_g_all)
             print("RMSE(GATED rain):", rmse_g_rain)
+
+            # --- 新增绘图集成逻辑 ---
+            try:
+                # 1. 统一维度为 (Batch, pre_step, Nodes)
+                # y_pred_norm 目前是 (B, N, pre)，需要 permute 转回 (B, pre, N)
+                viz_pred = y_pred_norm.permute(0, 2, 1).detach().cpu()
+
+                # 2. 反归一化为真实降水量 (mm)
+                viz_pred_mm = inv_y(viz_pred).numpy()
+                viz_true_mm = test_y_mm.numpy()  # 前文已经计算好的真值 mm
+
+                print("正在生成降水对比图...")
+                # 3. 调用绘图函数 (window_size 可根据需求调整)
+                plot_rainy_session(viz_true_mm, viz_pred_mm, window_size=200)
+
+            except Exception as e:
+                print(f"可视化失败: {e}")
 
             p_stats = p.detach().cpu()
             print("p stats(min/mean/max) =",
