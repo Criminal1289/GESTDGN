@@ -110,7 +110,7 @@ def SaveNpy(data, dataname, filepath="..\\MeteoData\\"):
 def Forecast(his_step, fore_step, x, y, lack=None):
     # x [num, city, feature]
     # y [num, city]
-    RSME = []
+    RMSE = []
     MAE = []
     SKILL = []
     feature_num = x.shape[2]
@@ -160,11 +160,11 @@ def Forecast(his_step, fore_step, x, y, lack=None):
             rmse = measure.GetRMSE(test_outputs, test_y)
             mae = measure.GetMAP(test_outputs, test_y)
             skill = measure.Skill(test_outputs, test_y)
-            RSME.append(rmse)
+            RMSE.append(rmse)
             MAE.append(mae)
             SKILL.append(skill)
 
-    SaveNpy(RSME, "RMSE" + str(lack))
+    SaveNpy(RMSE, "RMSE" + str(lack))
     SaveNpy(MAE, "MAE" + str(lack))
     SaveNpy(SKILL, "SKILL" + str(lack))
 

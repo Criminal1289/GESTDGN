@@ -265,8 +265,8 @@ class trainer():
 
                     self.model.train()
         model_name = self.model.__class__.__name__
-        np.save("valid_RSME_" + model_name + '.npy', np.array(valid_rmse_all_list))
-        np.save("train_Loss_" + model_name + '.npy', np.array(train_loss))
+        np.save("log/valid_RSME_" + model_name + '.npy', np.array(valid_rmse_all_list))
+        np.save("log/train_Loss_" + model_name + '.npy', np.array(train_loss))
 
         if self.valid is not None:
             print('valid result (all): ', rmse_all)

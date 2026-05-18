@@ -12,7 +12,7 @@ from GE.parallel import MultiPro
 import time
 import sys
 sys.path.append('..')
-from tester import fitness_cal
+from tester_cnn import fitness_cal
 # import Graph.Main as GM
 
 

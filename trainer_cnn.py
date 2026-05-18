@@ -1,3 +1,5 @@
+import os.path
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,6 +12,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 cuda_gpu = torch.cuda.is_available()
 p_thr = 0.5
+save_dir = "./log"
 
 
 def focal_bce_with_logits(logits, targets, mask=None, alpha=0.25, gamma=2.0):
@@ -391,8 +394,8 @@ class trainer():
                 self.model.train()
 
         model_name = self.model.__class__.__name__
-        np.save("valid_RSME_" + model_name + '.npy', np.array(valid_rmse_all_list))
-        np.save("train_Loss_" + model_name + '.npy', np.array(train_loss))
+        np.save(os.path.join(save_dir, "valid_RMSE_" + model_name + '.npy'), np.array(valid_rmse_all_list))
+        np.save(os.path.join(save_dir, "train_Loss_" + model_name + '.npy'), np.array(train_loss))
 
         if self.valid is not None:
             print('valid result (all): ', rmse_all)
