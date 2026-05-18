@@ -3,7 +3,7 @@
 import torch
 import argparse
 import numpy as np
-from model_cnn import STDGN
+from model_cnn_tucancha_featureAttention import STDGN
 from graph_evolution import Evolution, print_genetation
 from trainer_cnn import trainer
 from tester_cnn import test
@@ -20,15 +20,15 @@ parser.add_argument('--heads', type=int, default=2, help='heads of multi-head at
 parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
 parser.add_argument('--feature', type=int, default=37, help='features used in prediction')
 parser.add_argument('--nodes', type=int, default=1024, help='number of nodes')
-parser.add_argument('--his_len', type=int, default=4, help='input sequence length')
-parser.add_argument('--pre_len', type=int, default=3, help='output sequence length')
+parser.add_argument('--his_len', type=int, default=6, help='input sequence length')
+parser.add_argument('--pre_len', type=int, default=4, help='output sequence length')
 parser.add_argument('--units', type=int, default=64, help='hidden units')
 parser.add_argument('--adj_Set', type=str, default='data/AdjSet(GE).npy', help='best two adjs by graph evolution')
 
 # hyper-parameter of training
 parser.add_argument('--batch_size', type=int, default=8, help='batch size')
 parser.add_argument('--train', type=float, default=0.8, help='ratio of training set')
-parser.add_argument('--lr', type=float, default=2e-3, help='learning rate')
+parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0, help='weight decay rate')
 parser.add_argument('--epochs', type=int, default=100, help='epochs')
 parser.add_argument('--optim', type=str, default='adam')

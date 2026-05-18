@@ -91,8 +91,8 @@ def test(model, his_step, pre_step, x, y):
         fore_y_mm = (fore_y_raw * 0.1).clamp_min(0.0)  # ✅ 真值：mm
 
         # 可选：如果你后面还需要“真值norm空间”，再算一份（不强制）
-        y_log_min = float(np.load("y_log_min.npy"))
-        y_log_max = float(np.load("y_log_max.npy"))
+        y_log_min = float(np.load("log/y_log_min.npy"))
+        y_log_max = float(np.load("log/y_log_max.npy"))
         y_log_range = y_log_max - y_log_min + 1e-8
         print("[DEBUG] y raw stats:", float(fore_y_raw.min()), float(fore_y_raw.mean()), float(fore_y_raw.max()))
         print("[DEBUG] y mm(stats after *0.1):", float(fore_y_mm.min()), float(fore_y_mm.mean()),

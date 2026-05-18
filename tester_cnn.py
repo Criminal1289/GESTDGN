@@ -80,8 +80,8 @@ def _is_sample_mode(model):
 
 
 def _load_y_norm_params():
-    y_log_min = float(np.load("y_log_min.npy"))
-    y_log_max = float(np.load("y_log_max.npy"))
+    y_log_min = float(np.load("log/y_log_min.npy"))
+    y_log_max = float(np.load("log/y_log_max.npy"))
     y_log_range = y_log_max - y_log_min + 1e-8
     return y_log_min, y_log_max, y_log_range
 
@@ -113,7 +113,7 @@ def _safe_print_cls_metrics(p_rain, fore_y_mm):
     print("=== CLS metrics ===")
 
     # 降雨量阈值：0.1~5 中选几个典型值
-    rain_thr_list = [0.1, 0.5, 1.0, 2.0, 5.0]
+    rain_thr_list = [0.1, 2.6, 8.1, 16.0]
 
     # 固定概率阈值
     p_thr_list = [0.4, 0.5, 0.6]
@@ -181,7 +181,7 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
         print("count ty>=1.0:", int((valid_ty >= 1.0).sum().item()))
         print("count ty>=5.0:", int((valid_ty >= 5.0).sum().item()))
 
-        for thr in [0.1, 1.0, 5.0]:
+        for thr in [0.1, 2.6, 8.1, 16.0]:
             y_event = (ty >= thr)
             pred_event = (to >= thr)
 

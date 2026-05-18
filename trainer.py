@@ -131,8 +131,8 @@ class trainer():
             y_norm = (y_log - y_log_min) / y_log_range
             y_ones = y_norm.reshape(B, pre, N)
             # 保存反归一化参数
-            np.save("y_log_min.npy", np.array(y_log_min, dtype=np.float32))
-            np.save("y_log_max.npy", np.array(y_log_max, dtype=np.float32))
+            np.save("log/y_log_min.npy", np.array(y_log_min, dtype=np.float32))
+            np.save("log/y_log_max.npy", np.array(y_log_max, dtype=np.float32))
             hist_x = torch.tensor(x_ones, dtype=torch.float32)
             fore_y = torch.tensor(y_ones, dtype=torch.float32)
         else:
@@ -153,8 +153,8 @@ class trainer():
                                                                             valid=0.05)
 
         # ===== log1p inverse 参数（只加载一次）=====
-        y_log_min = float(np.load("y_log_min.npy"))
-        y_log_max = float(np.load("y_log_max.npy"))
+        y_log_min = float(np.load("log/y_log_min.npy"))
+        y_log_max = float(np.load("log/y_log_max.npy"))
         y_log_range = y_log_max - y_log_min + 1e-8
 
         def inv_y(y_norm):

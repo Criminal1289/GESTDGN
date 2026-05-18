@@ -1,11 +1,8 @@
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
 import numpy as np
 import measure
 import torch.nn.functional as Fu
-from draw_plot_rain import plot_rainy_session
 
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -176,8 +173,8 @@ class trainer():
             y_norm = (y_log - y_log_min) / y_log_range
             y_ones = y_norm.reshape(B, pre, N)
 
-            np.save("y_log_min.npy", np.array(y_log_min, dtype=np.float32))
-            np.save("y_log_max.npy", np.array(y_log_max, dtype=np.float32))
+            np.save("log/y_log_min.npy", np.array(y_log_min, dtype=np.float32))
+            np.save("log/y_log_max.npy", np.array(y_log_max, dtype=np.float32))
 
             hist_x = torch.tensor(x_ones, dtype=torch.float32)
             fore_y = torch.tensor(y_ones, dtype=torch.float32)
@@ -196,8 +193,8 @@ class trainer():
             hist_x, fore_y = Divide(source_x, source_y, self.his, self.pre)
 
             # 为了统一后面的 inv_y 流程，这里也存一份
-            np.save("y_log_min.npy", np.array(0.0, dtype=np.float32))
-            np.save("y_log_max.npy", np.array(1.0, dtype=np.float32))
+            np.save("log/y_log_min.npy", np.array(0.0, dtype=np.float32))
+            np.save("log/y_log_max.npy", np.array(1.0, dtype=np.float32))
 
         train_x, train_y, valid_x, valid_y, test_x, test_y = TrainValidTest(
             hist_x, fore_y, train=self.trainset, valid=0.05
@@ -222,8 +219,8 @@ class trainer():
         y_norm = (y_log - y_log_min) / y_log_range
         y_ones = y_norm.reshape(y_np.shape[0], y_np.shape[1], y_np.shape[2])
 
-        np.save("y_log_min.npy", np.array(y_log_min, dtype=np.float32))
-        np.save("y_log_max.npy", np.array(y_log_max, dtype=np.float32))
+        np.save("log/y_log_min.npy", np.array(y_log_min, dtype=np.float32))
+        np.save("log/y_log_max.npy", np.array(y_log_max, dtype=np.float32))
 
         (
             train_x, train_radar, train_y,
@@ -261,8 +258,8 @@ class trainer():
                 test_x, test_radar, test_y
             ) = self._prepare_sample_data()
 
-        y_log_min = float(np.load("y_log_min.npy"))
-        y_log_max = float(np.load("y_log_max.npy"))
+        y_log_min = float(np.load("log/y_log_min.npy"))
+        y_log_max = float(np.load("log/y_log_max.npy"))
         y_log_range = y_log_max - y_log_min + 1e-8
 
         def inv_y(y_norm):
@@ -309,6 +306,8 @@ class trainer():
         Valid_y = inv_y(valid_y.cpu())
 
         for e in range(self.epoch):
+            epoch_loss = 0.0
+            batch_count = 0
             for i, data in enumerate(train_loader):
                 if not sample_mode:
                     inputs, target = data
@@ -337,10 +336,11 @@ class trainer():
                 rain_mask = (target_mm >= 0.1).float()
                 per = Fu.smooth_l1_loss(y_hat, target, reduction="none")
                 w = (
-                    1.0
-                    + 2.0 * (target_mm >= 0.1).float()
-                    + 3.0 * (target_mm >= 2.5).float()
-                    + 10.0 * (target_mm >= 8.0).float()
+                        1.0
+                        + 1.0 * (target_mm >= 0.1).float()
+                        + 2.0 * (target_mm >= 2.6).float()
+                        + 5.0 * (target_mm >= 8.1).float()
+                        + 10.0 * (target_mm >= 16.0).float()
                 )
                 loss_reg = (per * w * rain_mask).sum() / (rain_mask.sum() + 1e-6)
 
@@ -351,40 +351,44 @@ class trainer():
                 loss.backward()
                 optimizer.step()
 
-            if (e + 1) % 10 == 0:
-                print('Epoch [{}/{}], Loss:{:.4f}'.format(e + 1, self.epoch, loss.item()))
-                train_loss.append(loss.item())
+                epoch_loss += loss.item()
+                batch_count += 1
 
-                with torch.no_grad():
-                    self.model.eval()
+            avg_train_loss = epoch_loss / max(batch_count, 1)
 
-                    if not sample_mode:
-                        valid_x = valid_x.to(self.device)
-                        y_hat, logit_rain = self.model(valid_x)
-                    else:
-                        valid_x = valid_x.to(self.device)
-                        valid_radar = valid_radar.to(self.device)
-                        y_hat, logit_rain = self.model(valid_x, valid_radar)
+            print('Epoch [{}/{}], Loss:{:.4f}'.format(e + 1, self.epoch, avg_train_loss))
+            train_loss.append(avg_train_loss)
 
-                    valid_outputs = y_hat.permute(0, 2, 1).contiguous()   # (B, pre, N)
-                    valid_outputs_mm = inv_y(valid_outputs.detach().cpu())
+            with torch.no_grad():
+                self.model.eval()
 
-                    mask_all = torch.ones_like(Valid_y, dtype=torch.bool)
-                    mask_rain = (Valid_y >= 0.1)
+                if not sample_mode:
+                    valid_x = valid_x.to(self.device)
+                    y_hat, logit_rain = self.model(valid_x)
+                else:
+                    valid_x = valid_x.to(self.device)
+                    valid_radar = valid_radar.to(self.device)
+                    y_hat, logit_rain = self.model(valid_x, valid_radar)
 
-                    rmse_all = safe_rmse(valid_outputs_mm, Valid_y, mask_all)
-                    rmse_rain = safe_rmse(valid_outputs_mm, Valid_y, mask_rain)
+                valid_outputs = y_hat.permute(0, 2, 1).contiguous()  # (B, pre, N)
+                valid_outputs_mm = inv_y(valid_outputs.detach().cpu())
 
-                    p = torch.sigmoid(logit_rain)
-                    event = (p >= p_thr).float()
-                    print("pred_event_ratio =", event.mean().item())
+                mask_all = torch.ones_like(Valid_y, dtype=torch.bool)
+                mask_rain = (Valid_y >= 0.1)
 
-                    valid_rmse_all_list.append(rmse_all)
-                    valid_rmse_rain_list.append(rmse_rain)
-                    print("valid RMSE_all :", rmse_all)
-                    print("valid RMSE_rain:", rmse_rain)
+                rmse_all = safe_rmse(valid_outputs_mm, Valid_y, mask_all)
+                rmse_rain = safe_rmse(valid_outputs_mm, Valid_y, mask_rain)
 
-                    self.model.train()
+                p = torch.sigmoid(logit_rain)
+                event = (p >= p_thr).float()
+                print("pred_event_ratio =", event.mean().item())
+
+                valid_rmse_all_list.append(rmse_all)
+                valid_rmse_rain_list.append(rmse_rain)
+                print("valid RMSE_all :", rmse_all)
+                print("valid RMSE_rain:", rmse_rain)
+
+                self.model.train()
 
         model_name = self.model.__class__.__name__
         np.save("valid_RSME_" + model_name + '.npy', np.array(valid_rmse_all_list))
@@ -439,23 +443,6 @@ class trainer():
 
             print("RMSE(GATED all):", rmse_g_all)
             print("RMSE(GATED rain):", rmse_g_rain)
-
-            # --- 新增绘图集成逻辑 ---
-            try:
-                # 1. 统一维度为 (Batch, pre_step, Nodes)
-                # y_pred_norm 目前是 (B, N, pre)，需要 permute 转回 (B, pre, N)
-                viz_pred = y_pred_norm.permute(0, 2, 1).detach().cpu()
-
-                # 2. 反归一化为真实降水量 (mm)
-                viz_pred_mm = inv_y(viz_pred).numpy()
-                viz_true_mm = test_y_mm.numpy()  # 前文已经计算好的真值 mm
-
-                print("正在生成降水对比图...")
-                # 3. 调用绘图函数 (window_size 可根据需求调整)
-                plot_rainy_session(viz_true_mm, viz_pred_mm, window_size=200)
-
-            except Exception as e:
-                print(f"可视化失败: {e}")
 
             p_stats = p.detach().cpu()
             print("p stats(min/mean/max) =",

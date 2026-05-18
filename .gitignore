@@ -19,3 +19,4 @@ bin-release/
 **/BJ/
 **/.idea/
 **/compare
+*.npy

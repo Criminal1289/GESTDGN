@@ -10,12 +10,12 @@ from matplotlib.ticker import MultipleLocator
 def load_all_data():
     results = {}
 
-    # (1) STDGN - 每10个epoch记录一次 (Numpy)
+    # (1) STDGN - 每1个epoch记录一次 (Numpy)
     try:
         results['STDGN'] = {
-            'loss': np.load('train_Loss_STDGN.npy'),
-            'rmse': np.load('valid_RSME_STDGN.npy'),
-            'step': 10
+            'loss': np.load('./compare/train_Loss_STDGN.npy'),
+            'rmse': np.load('./compare/valid_RMSE_rain_STDGN.npy'),
+            'step': 1
         }
     except FileNotFoundError:
         print("Warning: STDGN files not found.")
@@ -56,6 +56,18 @@ def load_all_data():
             }
     except FileNotFoundError:
         print("Warning: STGCN file not found.")
+
+    # (5) MR-GNF - 列表格式 (JSON)
+    try:
+        with open('./compare/history_mrgnf.json','r') as f:
+            data = json.load(f)
+            results['MR-GNF'] = {
+                'loss': [h['train']['loss'] for h in data],
+                'rmse': [h['val']['h01_rmse_mm'] for h in data],
+                'step': 1
+            }
+    except FileNotFoundError:
+        print("Warning: MR-GNF file not found.")
 
     return results
 
