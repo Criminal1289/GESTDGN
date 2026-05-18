@@ -20,3 +20,5 @@ bin-release/
 **/.idea/
 **/compare
 *.npy
+**/log
+gestdgn.zip

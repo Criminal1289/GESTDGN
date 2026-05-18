@@ -14,7 +14,7 @@ def load_all_data():
     try:
         results['STDGN'] = {
             'loss': np.load('./compare/train_Loss_STDGN.npy'),
-            'rmse': np.load('./compare/valid_RMSE_rain_STDGN.npy'),
+            'rmse': np.load('./compare/train_RMSE_all_STDGN.npy'),
             'step': 1
         }
     except FileNotFoundError:

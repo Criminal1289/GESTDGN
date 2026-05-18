@@ -242,6 +242,10 @@ class trainer():
 
     def train(self):
         train_loss = []
+
+        train_rmse_all_list = []
+        train_rmse_rain_list = []
+
         valid_rmse_all_list = []
         valid_rmse_rain_list = []
 
@@ -311,6 +315,11 @@ class trainer():
         for e in range(self.epoch):
             epoch_loss = 0.0
             batch_count = 0
+            train_sse_all = 0.0
+            train_cnt_all = 0
+
+            train_sse_rain = 0.0
+            train_cnt_rain = 0
             for i, data in enumerate(train_loader):
                 if not sample_mode:
                     inputs, target = data
@@ -330,6 +339,35 @@ class trainer():
 
                 with torch.no_grad():
                     target_mm = inv_y(target)
+                    # 分类头概率
+                    p_train = torch.sigmoid(logit_rain)
+
+                    if p_train.dim() == 2:
+                        p_train = p_train.unsqueeze(-1).expand_as(y_hat)
+                    elif p_train.shape[-1] == 1 and y_hat.shape[-1] > 1:
+                        p_train = p_train.expand_as(y_hat)
+
+                    # 分类头门控：判断无雨的位置置 0
+                    event_train = (p_train >= p_thr).float()
+
+                    # 回归头反归一化到 mm
+                    pred_train_mm_reg = inv_y(y_hat.detach())
+
+                    # 门控后的训练预测值
+                    pred_train_mm = pred_train_mm_reg * event_train
+
+                    # 计算训练集 all RMSE 的 SSE
+                    diff_train = pred_train_mm - target_mm
+
+                    train_sse_all += torch.sum(diff_train ** 2).item()
+                    train_cnt_all += diff_train.numel()
+
+                    # 计算训练集 rain RMSE 的 SSE
+                    train_mask_rain = (target_mm >= 0.1)
+
+                    if train_mask_rain.sum().item() > 0:
+                        train_sse_rain += torch.sum(diff_train[train_mask_rain] ** 2).item()
+                        train_cnt_rain += train_mask_rain.sum().item()
 
                 thr = 0.1
                 rain_label = (target_mm >= thr).float()
@@ -359,8 +397,22 @@ class trainer():
 
             avg_train_loss = epoch_loss / max(batch_count, 1)
 
-            print('Epoch [{}/{}], Loss:{:.4f}'.format(e + 1, self.epoch, avg_train_loss))
+            train_rmse_all = np.sqrt(train_sse_all / max(train_cnt_all, 1))
+
+            if train_cnt_rain > 0:
+                train_rmse_rain = np.sqrt(train_sse_rain / train_cnt_rain)
+            else:
+                train_rmse_rain = np.nan
+
+            print(
+                'Epoch [{}/{}], Loss:{:.4f}, Train RMSE_all:{:.4f}, Train RMSE_rain:{:.4f}'.format(
+                    e + 1, self.epoch, avg_train_loss, train_rmse_all, train_rmse_rain
+                )
+            )
+
             train_loss.append(avg_train_loss)
+            train_rmse_all_list.append(train_rmse_all)
+            train_rmse_rain_list.append(train_rmse_rain)
 
             with torch.no_grad():
                 self.model.eval()
@@ -373,18 +425,33 @@ class trainer():
                     valid_radar = valid_radar.to(self.device)
                     y_hat, logit_rain = self.model(valid_x, valid_radar)
 
-                valid_outputs = y_hat.permute(0, 2, 1).contiguous()  # (B, pre, N)
-                valid_outputs_mm = inv_y(valid_outputs.detach().cpu())
+                # 1. 回归头输出: (B, N, pre) -> (B, pre, N)
+                valid_outputs = y_hat.permute(0, 2, 1).contiguous()
+
+                # 2. 先反归一化到 mm
+                valid_outputs_mm_reg = inv_y(valid_outputs.detach().cpu())
+
+                # 3. 分类头输出概率: (B, N, pre) -> (B, pre, N)
+                p = torch.sigmoid(logit_rain)
+
+                if p.dim() == 2:
+                    p = p.unsqueeze(-1).expand_as(y_hat)
+                elif p.shape[-1] == 1 and y_hat.shape[-1] > 1:
+                    p = p.expand_as(y_hat)
+
+                event = (p >= p_thr).float()
+                event = event.permute(0, 2, 1).contiguous().cpu()
+
+                # 4. 分类头判断无雨的位置，回归结果强制置 0
+                valid_outputs_mm = valid_outputs_mm_reg * event
+
+                print("pred_event_ratio =", event.mean().item())
 
                 mask_all = torch.ones_like(Valid_y, dtype=torch.bool)
                 mask_rain = (Valid_y >= 0.1)
 
                 rmse_all = safe_rmse(valid_outputs_mm, Valid_y, mask_all)
                 rmse_rain = safe_rmse(valid_outputs_mm, Valid_y, mask_rain)
-
-                p = torch.sigmoid(logit_rain)
-                event = (p >= p_thr).float()
-                print("pred_event_ratio =", event.mean().item())
 
                 valid_rmse_all_list.append(rmse_all)
                 valid_rmse_rain_list.append(rmse_rain)
@@ -394,8 +461,21 @@ class trainer():
                 self.model.train()
 
         model_name = self.model.__class__.__name__
-        np.save(os.path.join(save_dir, "valid_RMSE_" + model_name + '.npy'), np.array(valid_rmse_all_list))
-        np.save(os.path.join(save_dir, "train_Loss_" + model_name + '.npy'), np.array(train_loss))
+        if model_name != 'STDGN_woa':
+            np.save(os.path.join(save_dir, "train_Loss_" + model_name + '.npy'),
+                    np.array(train_loss))
+
+            np.save(os.path.join(save_dir, "train_RMSE_all_" + model_name + '.npy'),
+                    np.array(train_rmse_all_list))
+
+            np.save(os.path.join(save_dir, "train_RMSE_rain_" + model_name + '.npy'),
+                    np.array(train_rmse_rain_list))
+
+            np.save(os.path.join(save_dir, "valid_RMSE_all_" + model_name + '.npy'),
+                    np.array(valid_rmse_all_list))
+
+            np.save(os.path.join(save_dir, "valid_RMSE_rain_" + model_name + '.npy'),
+                    np.array(valid_rmse_rain_list))
 
         if self.valid is not None:
             print('valid result (all): ', rmse_all)
@@ -436,10 +516,10 @@ class trainer():
             print("RMSE(REG rain):", rmse_reg_rain)
 
             event = (p >= p_thr).float()
-            y_pred_norm = y_hat * event
+            event = event.permute(0, 2, 1).contiguous().cpu()
 
-            test_outputs_g = y_pred_norm.permute(0, 2, 1).contiguous()
-            test_outputs_g_mm = inv_y(test_outputs_g.detach().cpu())
+            # 先反归一化，再置零，保证无雨位置真的是 0 mm
+            test_outputs_g_mm = test_outputs_reg_mm * event
 
             rmse_g_all = safe_rmse(test_outputs_g_mm, test_y_mm, mask_all)
             rmse_g_rain = safe_rmse(test_outputs_g_mm, test_y_mm, mask_rain)
@@ -451,4 +531,4 @@ class trainer():
             print("p stats(min/mean/max) =",
                   float(p_stats.min()), float(p_stats.mean()), float(p_stats.max()))
 
-        return rmse_reg_rain, self.model.cpu()
+        return rmse_g_rain, self.model.cpu()
