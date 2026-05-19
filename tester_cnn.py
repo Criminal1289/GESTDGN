@@ -2,9 +2,10 @@
 # -*- coding:utf-8 -*-
 import glob
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import numpy as np
-
+import matplotlib.pyplot as plt
 from trainer_cnn import trainer, Divide, TrainValidTest, TrainValidTestSample
 from model_cnn import STDGN_woa
 import measure
@@ -138,6 +139,186 @@ def _safe_print_cls_metrics(p_rain, fore_y_mm):
                 f"POD={POD:.4f} FAR={FAR:.4f} CSI={CSI:.4f}"
             )
 
+
+def plot_step_rmse_proof(outputs, y_hat_mm, fore_y_mm, pre_step, save_dir="fig_step_proof"):
+    """
+    画图证明：
+    1. step0-3 的 RMSE 下降；
+    2. 同时真实降雨均值、雨区数量、强降雨数量也在下降；
+    3. 因此整体 RMSE 下降主要受真实降雨分布变化影响，而不能简单解释为预测越远越准。
+
+    outputs: 门控后的预测结果, shape = [B, pre_step, N]
+    y_hat_mm: 纯回归头预测结果, shape = [B, pre_step, N]
+    fore_y_mm: 真实降雨, shape = [B, pre_step, N]
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    steps = []
+    rmse_all_list = []
+    rmse_rain_list = []
+    rmse_heavy_list = []
+    rmse_reg_all_list = []
+    true_mean_list = []
+    true_max_list = []
+    pred_mean_list = []
+    rain_count_list = []
+    heavy_count_list = []
+    light_count_list = []
+    zero_count_list = []
+
+    for i in range(pre_step):
+        to = outputs[:, i, :].detach().cpu()
+        to_reg = y_hat_mm[:, i, :].detach().cpu()
+        ty = fore_y_mm[:, i, :].detach().cpu()
+
+        # 有效值，正常情况下 ty>=0
+        m_all = ty >= 0
+        m_rain = ty >= 0.1
+        m_heavy = ty >= 5.0
+        m_light = (ty >= 0.1) & (ty < 1.0)
+        m_zero = ty < 0.1
+
+        def safe_rmse(pred, true, mask):
+            if mask.sum().item() == 0:
+                return np.nan
+            return torch.sqrt(torch.mean((pred[mask] - true[mask]) ** 2)).item()
+
+        rmse_all = safe_rmse(to, ty, m_all)
+        rmse_rain = safe_rmse(to, ty, m_rain)
+        rmse_heavy = safe_rmse(to, ty, m_heavy)
+        rmse_reg_all = safe_rmse(to_reg, ty, m_all)
+
+        steps.append(i)
+        rmse_all_list.append(rmse_all)
+        rmse_rain_list.append(rmse_rain)
+        rmse_heavy_list.append(rmse_heavy)
+        rmse_reg_all_list.append(rmse_reg_all)
+
+        true_mean_list.append(ty[m_all].mean().item())
+        true_max_list.append(ty[m_all].max().item())
+        pred_mean_list.append(to[m_all].mean().item())
+
+        rain_count_list.append(m_rain.sum().item())
+        heavy_count_list.append(m_heavy.sum().item())
+        light_count_list.append(m_light.sum().item())
+        zero_count_list.append(m_zero.sum().item())
+
+    # ==============================
+    # 图1：RMSE 与真实降雨均值对照
+    # ==============================
+    fig, ax1 = plt.subplots(figsize=(7, 5))
+
+    ax1.plot(steps, rmse_all_list, marker='o', linewidth=2, label='RMSE_all')
+    ax1.set_xlabel('Forecast step')
+    ax1.set_ylabel('RMSE_all / mm')
+    ax1.set_xticks(steps)
+
+    ax2 = ax1.twinx()
+    ax2.plot(steps, true_mean_list, marker='s', linewidth=2, linestyle='--', label='True mean rainfall')
+    ax2.set_ylabel('True mean rainfall / mm')
+
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
+
+    plt.title('RMSE decreases with the decrease of true rainfall intensity')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "RMSE_VS_TRUE_MEAN.png"), dpi=300)
+    plt.close()
+
+    # ==============================
+    # 图2：不同 step 的雨区数量变化
+    # ==============================
+    x = np.arange(len(steps))
+    width = 0.25
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x - width, light_count_list, width=width, label='0.1 <= true < 1.0 mm')
+    plt.bar(x, rain_count_list, width=width, label='true >= 0.1 mm')
+    plt.bar(x + width, heavy_count_list, width=width, label='true >= 5.0 mm')
+
+    plt.xlabel('Forecast step')
+    plt.ylabel('Pixel count')
+    plt.xticks(x, [f'step{i}' for i in steps])
+    plt.title('Rainfall pixel counts decrease with forecast step')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "RAIN_PIXEL_COUNT_BY_STEP.png"), dpi=300)
+    plt.close()
+
+    # ==============================
+    # 图3：整体 RMSE、雨区 RMSE、强降雨 RMSE 对比
+    # ==============================
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, rmse_all_list, marker='o', linewidth=2, label='RMSE_all')
+    plt.plot(steps, rmse_rain_list, marker='s', linewidth=2, label='RMSE_rain: true >= 0.1 mm')
+    plt.plot(steps, rmse_heavy_list, marker='^', linewidth=2, label='RMSE_heavy: true >= 5.0 mm')
+    plt.plot(steps, rmse_reg_all_list, marker='d', linewidth=2, linestyle='--', label='RMSE_reg_only')
+
+    plt.xlabel('Forecast step')
+    plt.ylabel('RMSE / mm')
+    plt.xticks(steps)
+    plt.title('RMSE comparison under different evaluation masks')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "RMSE_ALL_RAIN_HEAVY_COMPARE.png"), dpi=300)
+    plt.close()
+
+    # ==============================
+    # 图4：真实降雨分布箱线图
+    # 用 log1p 是为了避免强降雨极端值把图拉得太扁
+    # ==============================
+    box_data = []
+    labels = []
+
+    for i in range(pre_step):
+        ty = fore_y_mm[:, i, :].detach().cpu()
+        valid_ty = ty[ty >= 0].numpy()
+
+        # 用 log1p 压缩尺度：log(1 + rain)
+        box_data.append(np.log1p(valid_ty))
+        labels.append(f'step{i}')
+
+    plt.figure(figsize=(8, 5))
+    plt.boxplot(box_data, labels=labels, showfliers=False)
+    plt.xlabel('Forecast step')
+    plt.ylabel('log(1 + true rainfall)')
+    plt.title('Distribution of true rainfall by forecast step')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "TRUE_RAINFALL_DISTRIBUTION_BOXPLOT.png"), dpi=300)
+    plt.close()
+
+    # ==============================
+    # 图5：保存统计表，论文可以直接整理成表格
+    # ==============================
+    csv_path = os.path.join(save_dir, "step_distribution_rmse_summary.csv")
+
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(
+            "step,true_mean,true_max,pred_mean,"
+            "rain_count_ge_0.1,heavy_count_ge_5.0,light_count_0.1_1.0,zero_count_lt_0.1,"
+            "rmse_all,rmse_rain,rmse_heavy,rmse_reg_only\n"
+        )
+
+        for i in range(pre_step):
+            f.write(
+                f"{steps[i]},"
+                f"{true_mean_list[i]:.6f},"
+                f"{true_max_list[i]:.6f},"
+                f"{pred_mean_list[i]:.6f},"
+                f"{rain_count_list[i]},"
+                f"{heavy_count_list[i]},"
+                f"{light_count_list[i]},"
+                f"{zero_count_list[i]},"
+                f"{rmse_all_list[i]:.6f},"
+                f"{rmse_rain_list[i]:.6f},"
+                f"{rmse_heavy_list[i]:.6f},"
+                f"{rmse_reg_all_list[i]:.6f}\n"
+            )
+
+    print(f"[Saved] step proof figures and csv saved to: {save_dir}")
+
 def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
     mask = torch.ones_like(fore_y_mm, dtype=torch.bool)
 
@@ -198,6 +379,14 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
 
             print(f"[thr={thr}] p_thr={p_thr:.2f} POD={pod:.4f} FAR={far:.4f} CSI={csi:.4f}")
 
+    # 新增：画图证明 step RMSE 下降的原因
+    plot_step_rmse_proof(
+        outputs=outputs,
+        y_hat_mm=y_hat_mm,
+        fore_y_mm=fore_y_mm,
+        pre_step=pre_step,
+        save_dir="fig_step_proof"
+    )
 
 def test(model, his_step, pre_step, x, y, radar=None):
     model = model.to(device)
