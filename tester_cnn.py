@@ -362,9 +362,17 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
         print("count ty>=1.0:", int((valid_ty >= 1.0).sum().item()))
         print("count ty>=5.0:", int((valid_ty >= 5.0).sum().item()))
 
+        p_step = p_rain[:, i, :]
+
         for thr in [0.1, 2.6, 8.1, 16.0]:
             y_event = (ty >= thr)
-            pred_event = (to >= thr)
+
+            if thr == 0.1:
+                # 有雨/无雨用分类头
+                pred_event = (p_step >= p_thr)
+            else:
+                # 中雨、强降水用分类头 + 回归量联合判断
+                pred_event = (p_step >= p_thr) & (to >= thr)
 
             yy = y_event[m]
             pp = pred_event[m]
@@ -464,8 +472,8 @@ def test(model, his_step, pre_step, x, y, radar=None):
         y_hat_mm = _inv_y(y_hat, y_log_min, y_log_range)
 
         p_rain = torch.sigmoid(logit_rain)
-        event = (p_rain >= p_thr).float()
-        outputs = y_hat_mm * event
+
+        outputs = y_hat_mm
 
         fore_y_mm = fore_y_mm.cpu()
 

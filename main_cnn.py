@@ -51,6 +51,9 @@ parser.add_argument('--sample_dir', type=str, default='../gestdgn/data/cnn_spati
                     help='raw sample npz dir')
 parser.add_argument('--patch_dir', type=str, default='../gestdgn/data/patch', help='patch dir')
 
+parser.add_argument('--causal_adj',type=str,default='causal/A_cau_ra.npy',help='RA Granger causal adjacency matrix')
+parser.add_argument('--causal_beta',type=float,default=0.1,help='weight of causal adjacency')
+
 args = parser.parse_args()
 device = torch.device(args.device)
 
@@ -261,7 +264,25 @@ if __name__ == "__main__":
 
     # -------------------- model --------------------
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    adj = torch.tensor(np.load(args.adj_Set)[0], dtype=torch.float32)
+    # 控制是否使用因果图
+    causal = True
+    if causal:
+        def row_normalize(A):
+            row_sum = A.sum(axis=1, keepdims=True)
+            return A / (row_sum + 1e-8)
+
+
+        A_ge = np.load(args.adj_Set)[0].astype(np.float32)
+        A_cau = np.load(args.causal_adj).astype(np.float32)
+        if A_ge.shape != A_cau.shape:
+            raise ValueError(f"A_ge shape {A_ge.shape} != A_cau shape {A_cau.shape}")
+        A_ge = row_normalize(A_ge)
+        A_cau = row_normalize(A_cau)
+        A_final = A_ge + args.causal_beta * A_cau
+        A_final = row_normalize(A_final)
+        adj = torch.tensor(A_final, dtype=torch.float32)
+    else:
+        adj = torch.tensor(np.load(args.adj_Set)[0], dtype=torch.float32)
 
     model = STDGN(
         num_units=args.units,

@@ -339,22 +339,12 @@ class trainer():
 
                 with torch.no_grad():
                     target_mm = inv_y(target)
-                    # 分类头概率
-                    p_train = torch.sigmoid(logit_rain)
-
-                    if p_train.dim() == 2:
-                        p_train = p_train.unsqueeze(-1).expand_as(y_hat)
-                    elif p_train.shape[-1] == 1 and y_hat.shape[-1] > 1:
-                        p_train = p_train.expand_as(y_hat)
-
-                    # 分类头门控：判断无雨的位置置 0
-                    event_train = (p_train >= p_thr).float()
 
                     # 回归头反归一化到 mm
                     pred_train_mm_reg = inv_y(y_hat.detach())
 
-                    # 门控后的训练预测值
-                    pred_train_mm = pred_train_mm_reg * event_train
+                    # HARD-GATED 之前的逻辑：训练 RMSE 使用纯回归头
+                    pred_train_mm = pred_train_mm_reg
 
                     # 计算训练集 all RMSE 的 SSE
                     diff_train = pred_train_mm - target_mm
@@ -439,13 +429,15 @@ class trainer():
                 elif p.shape[-1] == 1 and y_hat.shape[-1] > 1:
                     p = p.expand_as(y_hat)
 
-                event = (p >= p_thr).float()
-                event = event.permute(0, 2, 1).contiguous().cpu()
-
-                # 4. 分类头判断无雨的位置，回归结果强制置 0
-                valid_outputs_mm = valid_outputs_mm_reg * event
+                # 分类概率转成 (B, pre, N)，只用于观察分类头，不参与 RMSE
+                p_valid = p.permute(0, 2, 1).contiguous().cpu()
+                event = (p_valid >= p_thr).float()
 
                 print("pred_event_ratio =", event.mean().item())
+                print("p_valid min/mean/max =",
+                      float(p_valid.min()), float(p_valid.mean()), float(p_valid.max()))
+
+                valid_outputs_mm = valid_outputs_mm_reg
 
                 mask_all = torch.ones_like(Valid_y, dtype=torch.bool)
                 mask_rain = (Valid_y >= 0.1)
@@ -455,6 +447,7 @@ class trainer():
 
                 valid_rmse_all_list.append(rmse_all)
                 valid_rmse_rain_list.append(rmse_rain)
+
                 print("valid RMSE_all :", rmse_all)
                 print("valid RMSE_rain:", rmse_rain)
 
@@ -515,20 +508,8 @@ class trainer():
             print("RMSE(REG all):", rmse_reg_all)
             print("RMSE(REG rain):", rmse_reg_rain)
 
-            event = (p >= p_thr).float()
-            event = event.permute(0, 2, 1).contiguous().cpu()
-
-            # 先反归一化，再置零，保证无雨位置真的是 0 mm
-            test_outputs_g_mm = test_outputs_reg_mm * event
-
-            rmse_g_all = safe_rmse(test_outputs_g_mm, test_y_mm, mask_all)
-            rmse_g_rain = safe_rmse(test_outputs_g_mm, test_y_mm, mask_rain)
-
-            print("RMSE(GATED all):", rmse_g_all)
-            print("RMSE(GATED rain):", rmse_g_rain)
-
             p_stats = p.detach().cpu()
             print("p stats(min/mean/max) =",
                   float(p_stats.min()), float(p_stats.mean()), float(p_stats.max()))
 
-        return rmse_g_rain, self.model.cpu()
+        return rmse_reg_rain, self.model.cpu()
