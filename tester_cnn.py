@@ -364,7 +364,7 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
 
         p_step = p_rain[:, i, :]
 
-        for thr in [0.1, 2.6, 8.1, 16.0]:
+        for thr in [0.1, 2.0, 4.0, 8.0]:
             y_event = (ty >= thr)
 
             if thr == 0.1:

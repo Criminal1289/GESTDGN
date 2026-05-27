@@ -265,7 +265,7 @@ if __name__ == "__main__":
     # -------------------- model --------------------
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     # 控制是否使用因果图
-    causal = True
+    causal = False
     if causal:
         def row_normalize(A):
             row_sum = A.sum(axis=1, keepdims=True)
