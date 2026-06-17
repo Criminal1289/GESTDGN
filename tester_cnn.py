@@ -319,6 +319,148 @@ def plot_step_rmse_proof(outputs, y_hat_mm, fore_y_mm, pre_step, save_dir="fig_s
 
     print(f"[Saved] step proof figures and csv saved to: {save_dir}")
 
+def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_maps", sample_idx=None, grid_shape=None, max_steps=4):
+    """
+    绘制 step0-step3 的空间误差图：
+    第一行：GT
+    第二行：Pred
+    第三行：Error = Pred - GT
+
+    outputs: 预测结果，shape = [B, pre_step, N]，单位 mm
+    fore_y_mm: 真实降水，shape = [B, pre_step, N]，单位 mm
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    outputs = outputs.detach().cpu()
+    fore_y_mm = fore_y_mm.detach().cpu()
+
+    B, P, N = fore_y_mm.shape
+    steps_to_plot = min(pre_step, max_steps, P)
+
+    # 自动推断网格大小，例如 N=1024 -> 32x32
+    if grid_shape is None:
+        side = int(np.sqrt(N))
+        if side * side != N:
+            raise ValueError(
+                f"N={N} 不能自动 reshape 成正方形网格，请手动设置 grid_shape，例如 grid_shape=(32, 32)"
+            )
+        grid_shape = (side, side)
+
+    # 默认选择降雨最明显的样本，避免随机挑到几乎无雨样本
+    if sample_idx is None:
+        score = fore_y_mm[:, :steps_to_plot, :].sum(dim=(1, 2))
+        sample_idx = int(torch.argmax(score).item())
+
+    # 统一 GT 和 Pred 的色标，方便 step0-3 横向对比
+    gt_sel = fore_y_mm[sample_idx, :steps_to_plot, :]
+    pred_sel = outputs[sample_idx, :steps_to_plot, :]
+
+    rain_vmax = max(
+        float(gt_sel.max().item()),
+        float(pred_sel.max().item()),
+        1.0
+    )
+
+    err_sel = pred_sel - gt_sel
+    err_abs_max = max(float(torch.abs(err_sel).max().item()), 1.0)
+
+    fig, axes = plt.subplots(
+        3, steps_to_plot,
+        figsize=(4.2 * steps_to_plot, 9.5)
+    )
+
+    if steps_to_plot == 1:
+        axes = axes.reshape(3, 1)
+
+    rain_im = None
+    err_im = None
+
+    for i in range(steps_to_plot):
+        gt = fore_y_mm[sample_idx, i, :].reshape(grid_shape).numpy()
+        pred = outputs[sample_idx, i, :].reshape(grid_shape).numpy()
+        err = pred - gt
+
+        mae = np.mean(np.abs(err))
+        rmse = np.sqrt(np.mean(err ** 2))
+        bias = np.mean(err)
+
+        # =====================
+        # GT
+        # =====================
+        rain_im = axes[0, i].imshow(
+            gt,
+            cmap="jet",
+            vmin=0,
+            vmax=rain_vmax
+        )
+        axes[0, i].set_title(
+            f"GT Step {i}\nmax={gt.max():.1f} mm",
+            fontsize=10
+        )
+        axes[0, i].axis("off")
+
+        # =====================
+        # Pred
+        # =====================
+        axes[1, i].imshow(
+            pred,
+            cmap="jet",
+            vmin=0,
+            vmax=rain_vmax
+        )
+        axes[1, i].set_title(
+            f"Pred Step {i}\nmax={pred.max():.1f} mm",
+            fontsize=10
+        )
+        axes[1, i].axis("off")
+
+        # =====================
+        # Error = Pred - GT
+        # =====================
+        err_im = axes[2, i].imshow(
+            err,
+            cmap="RdBu_r",
+            vmin=-err_abs_max,
+            vmax=err_abs_max
+        )
+        axes[2, i].set_title(
+            f"Error Step {i}\nMAE={mae:.2f}, RMSE={rmse:.2f}, Bias={bias:.2f}",
+            fontsize=9
+        )
+        axes[2, i].axis("off")
+
+    cbar1 = fig.colorbar(
+        rain_im,
+        ax=axes[0:2, :].ravel().tolist(),
+        shrink=0.75,
+        pad=0.02
+    )
+    cbar1.set_label("Precipitation / mm")
+
+    cbar2 = fig.colorbar(
+        err_im,
+        ax=axes[2, :].ravel().tolist(),
+        shrink=0.75,
+        pad=0.02
+    )
+    cbar2.set_label("Error: Pred - GT / mm")
+
+    fig.suptitle(
+        f"Step 0-{steps_to_plot - 1} precipitation prediction error maps "
+        f"(sample_idx={sample_idx})",
+        fontsize=14
+    )
+
+    plt.savefig(
+        os.path.join(save_dir, "STEP0_3_GT_PRED_ERROR_MAPS.png"),
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    print(f"[Saved] step0-3 error maps saved to: {save_dir}")
+
 def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
     mask = torch.ones_like(fore_y_mm, dtype=torch.bool)
 
@@ -387,6 +529,16 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
 
             print(f"[thr={thr}] p_thr={p_thr:.2f} POD={pod:.4f} FAR={far:.4f} CSI={csi:.4f}")
 
+    # 新增：画 step0-step3 的 GT / Pred / Error 空间误差图
+    plot_step_error_maps(
+            outputs=outputs,
+            fore_y_mm=fore_y_mm,
+            pre_step=pre_step,
+            save_dir="fig_step_error_maps",
+            sample_idx=None,
+            grid_shape=(32, 32),
+            max_steps=4
+    )
     # 新增：画图证明 step RMSE 下降的原因
     plot_step_rmse_proof(
         outputs=outputs,

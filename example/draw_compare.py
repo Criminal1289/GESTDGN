@@ -69,6 +69,22 @@ def load_all_data():
     except FileNotFoundError:
         print("Warning: MR-GNF file not found.")
 
+    # (6) UniExtreme
+    # (6) UniExtreme - 字典格式 JSON，外层有 history
+    try:
+        with open('./compare/history_uniextreme.json', 'r') as f:
+            raw = json.load(f)
+
+            data = raw['history'] if isinstance(raw, dict) and 'history' in raw else raw
+
+            results['UniExtreme'] = {
+                'loss': [h['train']['loss'] for h in data],
+                'rmse': [h['val']['overall_RMSE'] for h in data],
+                'step': 1
+            }
+    except FileNotFoundError:
+        print("Warning: UniExtreme file not found.")
+
     return results
 
 
@@ -86,7 +102,9 @@ def plot_custom_style(title, ylabel, filename, data_dict, y_locator=None):
         'STDGN': '#d73027',  # 红色
         'ConvLSTM': '#4575b4',  # 深蓝色
         'GRU': '#31a354',  # 绿色
-        'STGCN': '#fe9929'  # 橘色
+        'STGCN': '#fe9929',  # 橘色
+        'MR-GNF': '#000000',
+        'UniExtreme': '#7b3294',
     }
 
     for model, (x, y) in data_dict.items():
