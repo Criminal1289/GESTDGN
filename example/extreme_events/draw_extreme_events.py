@@ -19,7 +19,7 @@ label_format_path = r"../../data/BJ/Label_Format_00001.txt"
 radar_format_path = r"../../data/BJ/RADA_Format_00001.txt"
 nwp_format_path = r"../../data/BJ/NWP_Format_00001.txt"
 
-output_png = r"../../example/extreme_events/matched_extreme_events_map.png"
+output_png = r"../../example/extreme_events/extreme_events_map.png"
 output_csv = r"../../example/extreme_events/matched_extreme_events_summary.csv"
 
 
@@ -403,7 +403,7 @@ def plot_plain_map(df, radar_info, nwp_info, output_png):
 
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title(f"Spatial Distribution of Matched Extreme Rainfall Events (n={len(df)})")
+    ax.set_title(f"Spatial Distribution of Matched Extreme Rainfall Events")
 
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend(loc="upper right")
@@ -494,7 +494,7 @@ def plot_satellite_map(df, radar_info, nwp_info, output_png):
     else:
         ax.set_axis_off()
 
-    ax.set_title(f"Spatial Distribution of Matched Extreme Rainfall Events (n={len(df)})")
+    ax.set_title(f"Spatial Distribution of Matched Extreme Rainfall Events")
     ax.grid(True, linestyle="--", alpha=0.25, color="white")
     ax.legend(loc="upper right")
 
