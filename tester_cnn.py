@@ -447,8 +447,7 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
     cbar2.set_label("Error: Pred - GT / mm")
 
     fig.suptitle(
-        f"Step 0-{steps_to_plot - 1} precipitation prediction error maps "
-        f"(sample_idx={sample_idx})",
+        f"Step 0-{steps_to_plot - 1} precipitation prediction error maps ",
         fontsize=14
     )
 
