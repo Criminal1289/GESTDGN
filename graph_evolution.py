@@ -59,7 +59,7 @@ class Evolution(object):
                 value, his = fun(returned_population, i)
                 if his == 'his':
                     self.history.append(value)
-        return list(set(returned_population.fronts[0]))
+        return list(dict.fromkeys(returned_population.fronts[0]))
 
     def acc_best(self, fronts):
         best_value = np.zeros(len(fronts[0].objectives))
@@ -77,7 +77,7 @@ class Evolution(object):
 
 def print_genetation(population, genetation):
     G_set = {}
-    G_obj = list(set(population.fronts[0]))
+    G_obj = list(dict.fromkeys(population.fronts[0]))
     G_set[genetation] = []
     for p in G_obj:
         G_set[genetation].append(p.objectives)

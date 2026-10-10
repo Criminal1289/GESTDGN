@@ -1,61 +1,119 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
 import glob
+import csv
+import json
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from trainer_cnn import trainer, Divide, TrainValidTest, TrainValidTestSample
-from model_cnn import STDGN_woa
+from model_cnn_tucancha_featureAttention import STDGN
 import measure
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-PATCH_GLOB = r"data/patch/patch_*.npy"
+SAMPLE_GLOB = r"data/cnn_spatial_align_slide/*.npz"
+_GE_SAMPLE_CACHE = {}
 
 p_thr = 0.5
 
 
-def build_samples_from_patches(patch_files, his_len, pre_len):
-    X_list, Y_list = [], []
-    for p in patch_files:
-        data = np.load(p)
-        if data.ndim != 3:
+def _sample_value(raw, candidates, path):
+    for key in candidates:
+        if key in raw:
+            return raw[key]
+    raise KeyError(f"{os.path.basename(path)} missing keys {candidates}; actual={list(raw.keys())}")
+
+
+def _clean_sample_nwp(nwp):
+    nwp = nwp.astype(np.float32, copy=True)
+    invalid = (~np.isfinite(nwp)) | (nwp <= -9999.0)
+    nwp[invalid] = np.nan
+    return nwp
+
+
+def build_ge_samples_from_raw(sample_files, his_len, pre_len):
+    """Build the same NWP/Radar targets used by main_cnn sample training."""
+    nwp_list, radar_list, target_list = [], [], []
+    needed_t = his_len + pre_len - 1
+
+    for path in sample_files:
+        with np.load(path, allow_pickle=True) as raw:
+            nwp = _clean_sample_nwp(_sample_value(raw, ['nwp', 'NWP', 'x_nwp'], path))
+            radar = _sample_value(raw, ['radar', 'RADAR', 'x_radar'], path).astype(np.float32)
+            label = _sample_value(raw, ['label', 'LABEL', 'y', 'rain', 'target'], path).astype(np.float32)
+
+        if label.ndim == 4 and label.shape[1] == 1:
+            label = label[:, 0]
+        if nwp.ndim != 5 or radar.ndim != 4 or label.ndim != 3:
+            raise ValueError(
+                f"Unexpected sample shapes in {os.path.basename(path)}: "
+                f"nwp={nwp.shape}, radar={radar.shape}, label={label.shape}"
+            )
+        if not (nwp.shape[0] == radar.shape[0] == label.shape[0]):
+            raise ValueError(
+                f"Time length mismatch in {os.path.basename(path)}: "
+                f"nwp={nwp.shape[0]}, radar={radar.shape[0]}, label={label.shape[0]}"
+            )
+
+        total_t = nwp.shape[0]
+        if total_t < needed_t:
             continue
 
-        T, N, F = data.shape
-        if T < his_len + pre_len:
-            continue
+        for start in range(total_t - needed_t + 1):
+            target_start = start + his_len - 1
+            y_label = label[target_start:target_start + pre_len]
 
-        for t in range(T - his_len - pre_len + 1):
-            x = data[t:t + his_len, :, :-1]
-            y = data[t + his_len:t + his_len + pre_len, :, -1]
-            X_list.append(x)
-            Y_list.append(y)
+            y_small = []
+            for field in y_label:
+                height, width = field.shape
+                stride_h, stride_w = height // 32, width // 32
+                field_32 = field[:32 * stride_h, :32 * stride_w].reshape(
+                    32, stride_h, 32, stride_w
+                ).mean(axis=(1, 3))
+                y_small.append(field_32.reshape(-1))
 
-    if len(X_list) == 0:
-        raise RuntimeError("GE fitness_cal: no samples generated (his+pre too long or patches too short).")
+            nwp_list.append(nwp[start:start + his_len])
+            radar_list.append(radar[start:start + his_len])
+            target_list.append(np.stack(y_small, axis=0))
 
-    return np.stack(X_list), np.stack(Y_list)
+    if not nwp_list:
+        raise RuntimeError(
+            "GE fitness_cal: no sample windows generated; check sample length and his/pre settings."
+        )
+
+    return np.stack(nwp_list), np.stack(radar_list), np.stack(target_list)
+
+
+def _get_ge_sample_data(his_len, pre_len):
+    cache_key = (int(his_len), int(pre_len))
+    if cache_key not in _GE_SAMPLE_CACHE:
+        sample_files = sorted(glob.glob(SAMPLE_GLOB))
+        if not sample_files:
+            raise RuntimeError(f"GE fitness_cal: no sample files matched {SAMPLE_GLOB}")
+        _GE_SAMPLE_CACHE[cache_key] = build_ge_samples_from_raw(sample_files, his_len, pre_len)
+        print(f"[GE sample] files={len(sample_files)}, windows={_GE_SAMPLE_CACHE[cache_key][0].shape[0]}")
+    return _GE_SAMPLE_CACHE[cache_key]
 
 
 def fitness_cal(adjmat, device="cuda:0", his_len=None, pre_len=None):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
-
-    patch_files = sorted(glob.glob(PATCH_GLOB))
-    x, y = build_samples_from_patches(patch_files, his_len, pre_len)
+    x_nwp, x_radar, y = _get_ge_sample_data(his_len, pre_len)
 
     adj = torch.tensor(adjmat, dtype=torch.float32, device=device)
 
-    model = STDGN_woa(
+    model = STDGN(
         num_units=64,
         adj=adj,
-        num_nodes=x.shape[2],
-        num_feature=x.shape[3],
+        num_nodes=y.shape[2],
+        num_feature=37,
+        num_head=2,
         seq_len=his_len,
         pre_len=pre_len,
         device=device,
-        deep=1
+        deep=1,
+        input_mode="sample"
     ).to(device)
 
     model_train = trainer(
@@ -66,11 +124,13 @@ def fitness_cal(adjmat, device="cuda:0", his_len=None, pre_len=None):
         decay=0,
         his_step=his_len,
         pre_step=pre_len,
-        x=x,
+        x=x_nwp,
+        radar=x_radar,
         y=y,
         train=0.8,
         valid=None,
-        device=device
+        device=device,
+        seed=20
     )
     rmse, _ = model_train.train()
     return rmse, model
@@ -80,9 +140,9 @@ def _is_sample_mode(model):
     return getattr(model, "input_mode", "patch") == "sample"
 
 
-def _load_y_norm_params():
-    y_log_min = float(np.load("log/y_log_min.npy"))
-    y_log_max = float(np.load("log/y_log_max.npy"))
+def _load_y_norm_params(norm_dir="log"):
+    y_log_min = float(np.load(os.path.join(norm_dir, "y_log_min.npy")))
+    y_log_max = float(np.load(os.path.join(norm_dir, "y_log_max.npy")))
     y_log_range = y_log_max - y_log_min + 1e-8
     return y_log_min, y_log_max, y_log_range
 
@@ -110,34 +170,32 @@ def _inv_y(y_norm, y_log_min, y_log_range):
 #             f"[CLS thr=0.1] p_thr={p_thr_try:.2f} "
 #             f"POD={POD:.4f} FAR={FAR:.4f} CSI={CSI:.4f}"
 #         )
-def _safe_print_cls_metrics(p_rain, fore_y_mm):
-    print("=== CLS metrics ===")
+def rainfall_event_metrics(pred_mm, true_mm, threshold):
+    """Regression-only threshold scores; no untrained classification gate."""
+    if pred_mm.shape != true_mm.shape:
+        raise ValueError("Event metrics require matching rainfall fields")
+    valid = torch.isfinite(true_mm) & (true_mm >= 0)
+    pp = (pred_mm[valid] >= threshold)
+    yy = (true_mm[valid] >= threshold)
+    tp = int((pp & yy).sum().item())
+    fp = int((pp & ~yy).sum().item())
+    fn = int((~pp & yy).sum().item())
+    true_count, pred_count = tp + fn, tp + fp
 
-    # 降雨量阈值：0.1~5 中选几个典型值
-    rain_thr_list = [0.1, 2.6, 8.1, 16.0]
+    def ratio(numerator, denominator):
+        return numerator / denominator if denominator else float("nan")
 
-    # 固定概率阈值
-    p_thr_list = [0.4, 0.5, 0.6]
+    return dict(tp=tp, fp=fp, fn=fn, true_count=true_count, pred_count=pred_count,
+                pod=ratio(tp, true_count), far=ratio(fp, pred_count),
+                csi=ratio(tp, tp + fp + fn), area_ratio=ratio(pred_count, true_count))
 
-    for rain_thr in rain_thr_list:
-        event_true = (fore_y_mm >= rain_thr)
 
-        print(f"\n--- Rainfall threshold = {rain_thr:.1f} mm ---")
-        for p_thr_try in p_thr_list:
-            event_pred = (p_rain >= p_thr_try)
-
-            TP = (event_pred & event_true).sum().item()
-            FP = (event_pred & (~event_true)).sum().item()
-            FN = ((~event_pred) & event_true).sum().item()
-
-            POD = TP / (TP + FN + 1e-6)
-            FAR = FP / (TP + FP + 1e-6)
-            CSI = TP / (TP + FP + FN + 1e-6)
-
-            print(
-                f"[rain_thr={rain_thr:.1f}mm, p_thr={p_thr_try:.1f}] "
-                f"POD={POD:.4f} FAR={FAR:.4f} CSI={CSI:.4f}"
-            )
+def _print_regression_event_metrics(pred_mm, true_mm):
+    print("=== Regression rainfall event metrics (all steps) ===")
+    for threshold in (0.1, 1.5, 7.0, 15.0, 40.0):
+        metrics = rainfall_event_metrics(pred_mm, true_mm, threshold)
+        print(f"[thr={threshold:g} mm] POD={metrics['pod']:.4f} FAR={metrics['far']:.4f} "
+              f"CSI={metrics['csi']:.4f} area_ratio={metrics['area_ratio']:.4f}")
 
 
 def plot_step_rmse_proof(outputs, y_hat_mm, fore_y_mm, pre_step, save_dir="fig_step_proof"):
@@ -319,7 +377,7 @@ def plot_step_rmse_proof(outputs, y_hat_mm, fore_y_mm, pre_step, save_dir="fig_s
 
     print(f"[Saved] step proof figures and csv saved to: {save_dir}")
 
-def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_maps", sample_idx=None, grid_shape=None, max_steps=4):
+def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_maps", sample_idx=None, grid_shape=None, max_steps=4, sample_info=None):
     """
     绘制 step0-step3 的空间误差图：
     第一行：GT
@@ -348,9 +406,12 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
         grid_shape = (side, side)
 
     # 默认选择降雨最明显的样本，避免随机挑到几乎无雨样本
+    selection = "auto_max_total_rain" if sample_idx is None else "fixed_index"
     if sample_idx is None:
         score = fore_y_mm[:, :steps_to_plot, :].sum(dim=(1, 2))
         sample_idx = int(torch.argmax(score).item())
+    if not 0 <= sample_idx < B:
+        raise ValueError(f"Error-map sample index {sample_idx} is outside [0, {B})")
 
     # 统一 GT 和 Pred 的色标，方便 step0-3 横向对比
     gt_sel = fore_y_mm[sample_idx, :steps_to_plot, :]
@@ -376,6 +437,7 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
     rain_im = None
     err_im = None
 
+    step_metrics = []
     for i in range(steps_to_plot):
         gt = fore_y_mm[sample_idx, i, :].reshape(grid_shape).numpy()
         pred = outputs[sample_idx, i, :].reshape(grid_shape).numpy()
@@ -384,6 +446,8 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
         mae = np.mean(np.abs(err))
         rmse = np.sqrt(np.mean(err ** 2))
         bias = np.mean(err)
+        step_metrics.append(dict(step=i, true_max_mm=float(gt.max()), pred_max_mm=float(pred.max()),
+                                 mae_mm=float(mae), rmse_mm=float(rmse), bias_mm=float(bias)))
 
         # =====================
         # GT
@@ -446,8 +510,20 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
     )
     cbar2.set_label("Error: Pred - GT / mm")
 
+    identity = dict(sample_info or {})
+    title_suffix = ""
+    if identity:
+        parts = [f"global index {identity['global_index']}"] if 'global_index' in identity else []
+        if identity.get('partition'):
+            parts.append(str(identity['partition']))
+        if identity.get('checkpoint_epoch') is not None:
+            parts.append(f"epoch {identity['checkpoint_epoch']}")
+        if identity.get('issue_time'):
+            # Source files can omit the year; do not display the parser's anchor year.
+            parts.append(str(identity['issue_time'])[5:16].replace('T', ' '))
+        title_suffix = "\n" + " | ".join(parts)
     fig.suptitle(
-        f"Step 0-{steps_to_plot - 1} precipitation prediction error maps ",
+        f"Step 0-{steps_to_plot - 1} precipitation prediction error maps{title_suffix}",
         fontsize=14
     )
 
@@ -457,10 +533,15 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
         bbox_inches="tight"
     )
     plt.close()
+    with open(os.path.join(save_dir, "sample_metadata.json"), "w", encoding="utf-8") as stream:
+        json.dump(dict(identity, local_index=int(sample_idx), selection=selection, steps=step_metrics),
+                  stream, ensure_ascii=False, indent=2)
 
     print(f"[Saved] step0-3 error maps saved to: {save_dir}")
 
-def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
+def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step, output_dir=".",
+                    error_map_save_dir=None, sample_indices=None, sample_metadata=None,
+                    checkpoint_info=None):
     mask = torch.ones_like(fore_y_mm, dtype=torch.bool)
 
     rmse = measure.GetRMSE(outputs[mask], fore_y_mm[mask])
@@ -473,7 +554,8 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
     print("pred min/mean/max:", outputs.min().item(), outputs.mean().item(), outputs.max().item())
     print("true min/mean/max:", fore_y_mm.min().item(), fore_y_mm.mean().item(), fore_y_mm.max().item())
 
-    _safe_print_cls_metrics(p_rain, fore_y_mm)
+    _print_regression_event_metrics(outputs, fore_y_mm)
+    event_rows = []
 
     for i in range(pre_step):
         print('step ', i)
@@ -503,40 +585,37 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
         print("count ty>=1.0:", int((valid_ty >= 1.0).sum().item()))
         print("count ty>=5.0:", int((valid_ty >= 5.0).sum().item()))
 
-        p_step = p_rain[:, i, :]
+        for thr in (0.1, 1.5, 7.0, 15.0, 40.0):
+            metrics = rainfall_event_metrics(to, ty, thr)
+            event_rows.append(dict(step=i, threshold_mm=thr, **metrics))
+            print(f"[thr={thr:g} mm] POD={metrics['pod']:.4f} FAR={metrics['far']:.4f} "
+                  f"CSI={metrics['csi']:.4f} area_ratio={metrics['area_ratio']:.4f}")
 
-        for thr in [0.1, 2.0, 4.0, 8.0]:
-            y_event = (ty >= thr)
-
-            if thr == 0.1:
-                # 有雨/无雨用分类头
-                pred_event = (p_step >= p_thr)
-            else:
-                # 中雨、强降水用分类头 + 回归量联合判断
-                pred_event = (p_step >= p_thr) & (to >= thr)
-
-            yy = y_event[m]
-            pp = pred_event[m]
-
-            TP = (pp & yy).sum().item()
-            FP = (pp & (~yy)).sum().item()
-            FN = ((~pp) & yy).sum().item()
-
-            pod = TP / (TP + FN + 1e-9)
-            far = FP / (TP + FP + 1e-9)
-            csi = TP / (TP + FP + FN + 1e-9)
-
-            print(f"[thr={thr}] p_thr={p_thr:.2f} POD={pod:.4f} FAR={far:.4f} CSI={csi:.4f}")
+    proof_dir = os.path.join(output_dir, "fig_step_proof")
+    os.makedirs(proof_dir, exist_ok=True)
+    with open(os.path.join(proof_dir, "step_event_metrics_summary.csv"), "w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(event_rows[0]))
+        writer.writeheader()
+        writer.writerows(event_rows)
 
     # 新增：画 step0-step3 的 GT / Pred / Error 空间误差图
+    case_info = dict(checkpoint_info or {})
+    if sample_indices is not None:
+        local_index = int(fore_y_mm[:, :min(pre_step, 4), :].sum(dim=(1, 2)).argmax().item())
+        global_index = int(sample_indices[local_index])
+        case_info = dict(global_index=global_index, partition="test")
+        if sample_metadata is not None:
+            case_info.update(sample_metadata[global_index])
+        case_info.update(checkpoint_info or {})
     plot_step_error_maps(
             outputs=outputs,
             fore_y_mm=fore_y_mm,
             pre_step=pre_step,
-            save_dir="fig_step_error_maps",
+            save_dir=error_map_save_dir or os.path.join(output_dir, "fig_step_error_maps"),
             sample_idx=None,
             grid_shape=(32, 32),
-            max_steps=4
+            max_steps=4,
+            sample_info=case_info
     )
     # 新增：画图证明 step RMSE 下降的原因
     plot_step_rmse_proof(
@@ -544,15 +623,44 @@ def _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step):
         y_hat_mm=y_hat_mm,
         fore_y_mm=fore_y_mm,
         pre_step=pre_step,
-        save_dir="fig_step_proof"
+        save_dir=proof_dir
     )
 
-def test(model, his_step, pre_step, x, y, radar=None):
+def save_fixed_case_error_map(model, pre_step, x, y, radar, sample_info,
+                             norm_dir="log", output_dir="."):
+    """Draw one explicit diagnostic case without including it in test scores."""
+    if not _is_sample_mode(model):
+        raise ValueError("Fixed raw-sample diagnostics require sample mode")
+    if len(x) != 1 or len(y) != 1 or len(radar) != 1:
+        raise ValueError("Fixed-case diagnostics must contain exactly one window")
+    model = model.to(device)
+    model.eval()
+    y_log_min, _, y_log_range = _load_y_norm_params(norm_dir)
+    with torch.inference_mode():
+        y_hat, _ = model(torch.as_tensor(x, dtype=torch.float32, device=device),
+                         torch.as_tensor(radar, dtype=torch.float32, device=device))
+        pred_mm = _inv_y(y_hat.permute(0, 2, 1).cpu(), y_log_min, y_log_range)
+    target_mm = (torch.as_tensor(y, dtype=torch.float32) * 0.1).clamp_min(0.0)
+    plot_step_error_maps(pred_mm, target_mm, pre_step,
+                         save_dir=os.path.join(output_dir, "fig_step_error_maps"),
+                         sample_idx=0, grid_shape=(32, 32), sample_info=sample_info)
+
+
+def test(model, his_step, pre_step, x, y, radar=None, norm_dir="log", output_dir=".",
+         sample_indices=None, sample_metadata=None, error_map_data=None):
     model = model.to(device)
     model.eval()
 
     sample_mode = _is_sample_mode(model)
-    y_log_min, _, y_log_range = _load_y_norm_params()
+    y_log_min, _, y_log_range = _load_y_norm_params(norm_dir)
+    checkpoint_info = {}
+    summary_path = os.path.join(norm_dir, 'training_summary.json')
+    if os.path.isfile(summary_path):
+        with open(summary_path, encoding='utf-8') as stream:
+            summary = json.load(stream)
+        checkpoint = summary.get('evaluation_checkpoint', 'best' if summary.get('restored_best', True) else 'last')
+        checkpoint_info = dict(checkpoint=checkpoint, checkpoint_epoch=summary.get('evaluation_epoch',
+            summary['best_epoch'] if checkpoint == 'best' else summary['epochs_run']))
 
     with torch.no_grad():
         if not sample_mode:
@@ -628,4 +736,12 @@ def test(model, his_step, pre_step, x, y, radar=None):
 
         fore_y_mm = fore_y_mm.cpu()
 
-        _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step)
+        _eval_and_print(outputs, y_hat_mm, fore_y_mm, p_rain, pre_step, output_dir=output_dir,
+                        error_map_save_dir=(os.path.join(output_dir, "fig_test_error_maps")
+                                            if error_map_data is not None else None),
+                        sample_indices=sample_indices, sample_metadata=sample_metadata,
+                        checkpoint_info=checkpoint_info)
+
+    if error_map_data is not None:
+        save_fixed_case_error_map(model, pre_step, norm_dir=norm_dir,
+                                 output_dir=output_dir, **error_map_data)

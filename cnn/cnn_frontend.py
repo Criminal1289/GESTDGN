@@ -2,7 +2,6 @@ import os
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from make_knn_adj import build_knn_adj
 
@@ -88,11 +87,15 @@ class WindowFusion(nn.Module):
 
     def __init__(self, method="mean"):
         super().__init__()
+        if method not in ("mean", "center"):
+            raise ValueError(f"Unsupported fusion method: {method}")
         self.method = method
 
     def forward(self, x):
         if self.method == "mean":
             return x.mean(dim=2)
+        elif self.method == "center":
+            return x[:, :, 0]
         else:
             raise ValueError(f"Unsupported fusion method: {self.method}")
 
@@ -112,8 +115,74 @@ class CNNFrontEnd(nn.Module):
         self.radar_encoder = RadarEncoder(radar_in_ch, out_dim=radar_dim, dropout=dropout)
         self.fusion = WindowFusion(method=fusion)
 
+        self.register_buffer("nwp_mean", torch.zeros(1, nwp_in_ch, 1, 1))
+        self.register_buffer("nwp_std", torch.ones(1, nwp_in_ch, 1, 1))
+        self.register_buffer("radar_mean", torch.zeros(1, radar_in_ch, 1, 1))
+        self.register_buffer("radar_std", torch.ones(1, radar_in_ch, 1, 1))
+        self.register_buffer("normalization_fitted", torch.tensor(False, dtype=torch.bool))
+
         self.out_dim = nwp_dim + radar_dim
         self.has_saved_patch = False
+
+    @staticmethod
+    def _stream_channel_stats(data, channels, is_nwp, chunk_size=2):
+        channel_sum = torch.zeros(channels, dtype=torch.float64)
+        channel_sq_sum = torch.zeros(channels, dtype=torch.float64)
+        channel_count = torch.zeros(channels, dtype=torch.float64)
+
+        for start in range(0, data.shape[0], chunk_size):
+            chunk = data[start:start + chunk_size]
+            x = chunk.reshape(-1, channels, chunk.shape[-2], chunk.shape[-1])
+            valid = torch.isfinite(x)
+            if is_nwp:
+                valid = valid & (x > -9999.0)
+
+            clean = torch.where(valid, x, torch.zeros_like(x))
+            if not is_nwp:
+                clean = torch.clamp(clean, 0.0, 1.0)
+
+            clean = clean.to(torch.float64)
+            valid64 = valid.to(torch.float64)
+            reduce_dims = (0, 2, 3)
+            channel_sum += clean.sum(dim=reduce_dims).cpu()
+            channel_sq_sum += clean.square().sum(dim=reduce_dims).cpu()
+            channel_count += valid64.sum(dim=reduce_dims).cpu()
+
+        count = channel_count.clamp(min=1.0)
+        mean = channel_sum / count
+        var = channel_sq_sum / count - mean.square()
+        std = torch.sqrt(var.clamp(min=1e-6))
+        return mean.float().view(1, channels, 1, 1), std.float().view(1, channels, 1, 1)
+
+    @torch.no_grad()
+    def fit_normalization(self, nwp, radar):
+        if nwp.ndim != 6 or radar.ndim != 5:
+            raise ValueError(
+                f"Expected train NWP [S,T,Nw,C,H,W] and Radar [S,T,C,H,W], got {nwp.shape}, {radar.shape}"
+            )
+        if nwp.shape[3] != self.nwp_mean.shape[1] or radar.shape[2] != self.radar_mean.shape[1]:
+            raise ValueError(
+                f"Normalization channel mismatch: NWP={nwp.shape[3]}, Radar={radar.shape[2]}"
+            )
+
+        nwp_mean, nwp_std = self._stream_channel_stats(nwp, nwp.shape[3], is_nwp=True)
+        radar_mean, radar_std = self._stream_channel_stats(radar, radar.shape[2], is_nwp=False)
+        self.nwp_mean.copy_(nwp_mean.to(self.nwp_mean.device))
+        self.nwp_std.copy_(nwp_std.to(self.nwp_std.device))
+        self.radar_mean.copy_(radar_mean.to(self.radar_mean.device))
+        self.radar_std.copy_(radar_std.to(self.radar_std.device))
+        self.normalization_fitted.fill_(True)
+
+    def _clean_nwp(self, x):
+        valid = torch.isfinite(x) & (x > -9999.0)
+        x = torch.where(valid, x, self.nwp_mean.to(dtype=x.dtype))
+        return (x - self.nwp_mean.to(dtype=x.dtype)) / self.nwp_std.to(dtype=x.dtype).clamp(min=1e-6)
+
+    def _clean_radar(self, x):
+        valid = torch.isfinite(x)
+        x = torch.where(valid, x, self.radar_mean.to(dtype=x.dtype))
+        x = torch.clamp(x, 0.0, 1.0)
+        return (x - self.radar_mean.to(dtype=x.dtype)) / self.radar_std.to(dtype=x.dtype).clamp(min=1e-6)
 
     def forward(self, nwp, radar):
         """
@@ -124,11 +193,19 @@ class CNNFrontEnd(nn.Module):
         return:
             node_x : [B, 1024, T, D_total(+1)]
         """
+        if not bool(self.normalization_fitted.item()):
+            raise RuntimeError("CNNFrontEnd normalization has not been fitted on the training set")
+
+        # Window 0 must be the (0, 0) window in the sample metadata.
+        # Select before encoding so auxiliary windows cannot affect BatchNorm.
+        if self.fusion.method == "center":
+            nwp = nwp[:, :, :1]
         B, T, Nw, Cn, Hn, Wn = nwp.shape
         _, _, Cr, Hr, Wr = radar.shape
 
         # NWP
         nwp = nwp.reshape(B * T * Nw, Cn, Hn, Wn)
+        nwp = self._clean_nwp(nwp)
         nwp_feat = self.nwp_encoder(nwp)  # [B*T*Nw, Dn, 32, 32]
         Dn = nwp_feat.shape[1]
         nwp_feat = nwp_feat.reshape(B, T, Nw, Dn, 32, 32)  # [B, T, Nw, Dn, 32, 32]
@@ -136,12 +213,13 @@ class CNNFrontEnd(nn.Module):
 
         # Radar
         radar = radar.reshape(B * T, Cr, Hr, Wr)
+        radar = self._clean_radar(radar)
         radar_feat = self.radar_encoder(radar)  # [B*T, Dr, 32, 32]
         Dr = radar_feat.shape[1]
         radar_feat = radar_feat.reshape(B, T, Dr, 32, 32)  # [B, T, Dr, 32, 32]
 
         # 先拼 nwp/radar
-        feat = torch.cat([nwp_feat, radar_feat], dim=2)  # [B, T, D, 32, 32]
+        feat = torch.cat([nwp_feat, radar_feat], dim=2)
 
         B, T, D, H32, W32 = feat.shape
 

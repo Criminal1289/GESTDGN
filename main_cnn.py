@@ -2,11 +2,14 @@
 # -*- coding:utf-8 -*-
 import torch
 import argparse
+import hashlib
+import json
 import numpy as np
 from model_cnn_tucancha_featureAttention import STDGN
 from graph_evolution import Evolution, print_genetation
-from trainer_cnn import trainer
+from trainer_cnn import trainer, setup_seed
 from tester_cnn import test
+from precip_split import grouped_split_indices, window_metadata
 import glob, os
 from make_index_and_station_pro import generateFile
 
@@ -23,16 +26,59 @@ parser.add_argument('--nodes', type=int, default=1024, help='number of nodes')
 parser.add_argument('--his_len', type=int, default=6, help='input sequence length')
 parser.add_argument('--pre_len', type=int, default=4, help='output sequence length')
 parser.add_argument('--units', type=int, default=64, help='hidden units')
+parser.add_argument('--spatial_decoder', choices=['none', 'multiscale'], default='multiscale',
+                    help='32/16/8 spatial residual decoder; none runs the original regression head')
+parser.add_argument('--decoder_width', type=int, default=32, help='channels in the spatial residual decoder')
 parser.add_argument('--adj_Set', type=str, default='data/AdjSet(GE).npy', help='best two adjs by graph evolution')
+parser.add_argument('--regenerate_adj', action='store_true',
+                    help='rerun graph evolution and overwrite adj_Set; default reuses the existing fixed graph')
 
 # hyper-parameter of training
 parser.add_argument('--batch_size', type=int, default=8, help='batch size')
-parser.add_argument('--train', type=float, default=0.8, help='ratio of training set')
+parser.add_argument('--train', type=float, default=0.8,
+                    help='target training window fraction, approximated with whole event/day groups')
 parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0, help='weight decay rate')
 parser.add_argument('--epochs', type=int, default=100, help='epochs')
 parser.add_argument('--optim', type=str, default='adam')
 parser.add_argument('--device', type=str, default='cuda:0', help='CUDA id')
+parser.add_argument('--seed', type=int, default=20, help='global random seed')
+parser.add_argument('--loss_mode', choices=['mse_pm', 'legacy'], default='mse_pm',
+                    help='mse_pm: only physical rainfall MSE + PM; legacy: previous weighted SmoothL1 and auxiliaries')
+parser.add_argument('--mm_loss_weight', type=float, default=0.0,
+                    help='legacy only: auxiliary mm-space SmoothL1 weight')
+parser.add_argument('--mm_loss_scale', type=float, default=10.0,
+                    help='fixed rainfall scale and SmoothL1 transition in mm')
+parser.add_argument('--core_loss_weight', type=float, default=0.0,
+                    help='core/peak/compactness loss weight; disabled in the two-term baseline')
+parser.add_argument('--coverage_loss_weight', type=float, default=0.0,
+                    help='7/15/40 mm spatial coverage loss weight; 0 disables it for comparison')
+parser.add_argument('--pm_loss_weight', type=float, default=1.0,
+                    help='PM coefficient; mse_pm with 0 runs pure physical rainfall MSE')
+parser.add_argument('--pm_loss_scale', type=float, default=10.0,
+                    help='shared physical rainfall scale for MSE and PM in mse_pm mode, in mm')
+parser.add_argument('--fal_loss_weight', type=float, default=0.0,
+                    help='optional Fourier amplitude auxiliary weight (disabled by default)')
+parser.add_argument('--fcl_loss_weight', type=float, default=0.0,
+                    help='optional real Fourier correlation auxiliary weight (disabled by default)')
+parser.add_argument('--spectral_loss_scale', type=float, default=10.0,
+                    help='fixed physical scale for additive FAL/FCL adaptation, in mm')
+parser.add_argument('--split_mode', choices=['grouped', 'legacy'], default='grouped',
+                    help='sample mode: group connected events/dates; legacy is for historical diagnostics')
+parser.add_argument('--valid_ratio', type=float, default=0.1,
+                    help='target validation window fraction with whole groups; train+valid must be <1')
+parser.add_argument('--early_stopping_patience', type=int, default=0,
+                    help='stop after this many epochs without a better selected validation score; default 0 trains the full epoch budget')
+parser.add_argument('--checkpoint_metric', choices=['all','balanced'], default='balanced',
+                    help='checkpoint selection: all RMSE or all RMSE + strong weight * true >=7mm RMSE')
+parser.add_argument('--eval_checkpoint', choices=['last', 'best'], default='last',
+                    help='weights used after training: last uses the final epoch, best restores validation-selected weights')
+parser.add_argument('--strong_validation_weight', type=float, default=0.25,
+                    help='fixed weight of >=7mm conditional RMSE in validation selection, not training loss')
+parser.add_argument('--run_dir', type=str, default='runs/mse_pm',
+                    help='directory for this run normalization, split, checkpoint, metrics and figures')
+parser.add_argument('--error_map_global_index', type=int, default=65,
+                    help='fixed original raw-sample window for diagnostic maps; -1 uses the held-out test case')
 
 # hyper-parameter of graph evolution
 parser.add_argument('--num_CUDA', type=int, default='1', help='number of CUDA used in graph evolution')
@@ -47,6 +93,8 @@ parser.add_argument('--tournament', type=int, default=5, help='number of selecti
 parser.add_argument('--pareto', type=str, default='data/Pareto(GE)', help='pareto front of no dominant')
 
 parser.add_argument('--input_mode', type=str, default='sample', help='patch or sample(CNN)')
+parser.add_argument('--nwp_fusion', choices=['mean', 'center'], default='mean',
+                    help='mean: fuse all NWP windows; center: use window 0 only')
 parser.add_argument('--sample_dir', type=str, default='../gestdgn/data/cnn_spatial_align_slide',
                     help='raw sample npz dir')
 parser.add_argument('--patch_dir', type=str, default='../gestdgn/data/patch', help='patch dir')
@@ -55,6 +103,11 @@ parser.add_argument('--causal_adj',type=str,default='causal/A_cau_ra.npy',help='
 parser.add_argument('--causal_beta',type=float,default=0.1,help='weight of causal adjacency')
 
 args = parser.parse_args()
+if args.loss_mode == 'mse_pm' and any(getattr(args, name) != 0 for name in
+        ('mm_loss_weight', 'core_loss_weight', 'coverage_loss_weight', 'fal_loss_weight', 'fcl_loss_weight')):
+    parser.error('mse_pm uses only MSE + PM; auxiliary weights must be 0 (use --loss_mode legacy for the previous objective)')
+setup_seed(args.seed)
+print(f"[SEED] global seed fixed to {args.seed}")
 device = torch.device(args.device)
 
 
@@ -120,7 +173,18 @@ def _pick_key(data_dict, candidates, file_path):
     raise KeyError(f"{os.path.basename(file_path)} 中未找到这些 key: {candidates}，实际 keys={list(data_dict.keys())}")
 
 
-def build_samples_from_raw_samples(sample_files, his_len, pre_len):
+def _clean_nwp_array(nwp, file_path):
+    nwp = nwp.astype(np.float32, copy=True)
+    invalid = (~np.isfinite(nwp)) | (nwp <= -9999.0)
+    invalid_count = int(invalid.sum())
+    if invalid_count > 0:
+        # Keep missing values distinguishable until train-only normalization is fitted.
+        nwp[invalid] = np.nan
+        print(f"[NWP missing] {os.path.basename(file_path)} invalid={invalid_count}")
+    return nwp
+
+
+def build_samples_from_raw_samples(sample_files, his_len, pre_len, return_metadata=False):
     """
     sample 模式下只做时间窗切分，不做 CNN。
     真正的 CNN 前端在 model.forward() 里执行，这样参数才能参与反传。
@@ -135,6 +199,7 @@ def build_samples_from_raw_samples(sample_files, his_len, pre_len):
         y : [pre_len, 1024]
     """
     X_nwp_list, X_radar_list, X_label_list, Y_list = [], [], [], []
+    metadata = []
 
     min_T = 10 ** 9
     max_T = 0
@@ -146,6 +211,10 @@ def build_samples_from_raw_samples(sample_files, his_len, pre_len):
         nwp = _pick_key(raw, ['nwp', 'NWP', 'x_nwp'], p)
         radar = _pick_key(raw, ['radar', 'RADAR', 'x_radar'], p)
         label = _pick_key(raw, ['label', 'LABEL', 'y', 'rain', 'target'], p)
+        nwp = _clean_nwp_array(nwp, p)
+        if args.nwp_fusion == 'center':
+            if 'slide_offsets' not in raw or not np.array_equal(raw['slide_offsets'][0], [0, 0]):
+                raise ValueError(f'{p}: center fusion requires slide_offsets[0] == [0, 0]')
 
         if label.ndim == 4 and label.shape[1] == 1:
             label = label[:, 0, :, :]  # [T, H, W]
@@ -167,15 +236,28 @@ def build_samples_from_raw_samples(sample_files, his_len, pre_len):
         min_T = min(min_T, T)
         max_T = max(max_T, T)
 
-        if T < his_len + pre_len:
-            print(f"[SKIP short] {os.path.basename(p)} T={T} < {his_len + pre_len}")
+        # label[k] accumulates precipitation over (time[k], time[k] + 1 h],
+        # so the label at the final history time is the first forecast hour.
+        needed_T = his_len + pre_len - 1
+        if T < needed_T:
+            print(f"[SKIP short] {os.path.basename(p)} T={T} < {needed_T}")
+            raw.close()
             continue
 
+        if return_metadata:
+            if 'cp_name' not in raw or 'time_keys' not in raw:
+                raise ValueError(f'{p}: grouped split requires cp_name and time_keys metadata')
+            event = raw['cp_name'].item()
+            times = raw['time_keys'].tolist()
+            if len(times) != T:
+                raise ValueError(f'{p}: time_keys length must match the sample frames')
+
         cnt = 0
-        for t in range(T - his_len - pre_len + 1):
+        for t in range(T - needed_T + 1):
             x_nwp = nwp[t: t + his_len]  # [his, Nw, C, H, W]
             x_radar = radar[t: t + his_len]  # [his, C, H, W]
-            y_label = label[t + his_len: t + his_len + pre_len]  # [pre, H, W]
+            target_start = t + his_len - 1
+            y_label = label[target_start: target_start + pre_len]  # [pre, H, W]
 
             # 这里不做 CNN，只把 label 目标缩成 32x32 并展平为 1024
             # 纯 numpy 近邻下采样，避免在 main 引入 torch 图计算
@@ -192,13 +274,16 @@ def build_samples_from_raw_samples(sample_files, his_len, pre_len):
             X_nwp_list.append(x_nwp)
             X_radar_list.append(x_radar)
             Y_list.append(y_small)
+            if return_metadata:
+                metadata.append(window_metadata(event, times, p, t, his_len, pre_len))
             cnt += 1
 
         ok_files += 1
         print(f"[OK] {os.path.basename(p)} T={T} -> samples={cnt}")
+        raw.close()
 
     print(f"[STAT] sample_files={len(sample_files)} ok_files={ok_files} "
-          f"samples={len(X_nwp_list)} T_range=[{min_T},{max_T}] his+pre={his_len + pre_len}")
+          f"samples={len(X_nwp_list)} T_range=[{min_T},{max_T}] needed_T={his_len + pre_len - 1}")
 
     if len(X_nwp_list) == 0:
         raise RuntimeError("没有任何 raw sample 样本生成：请检查 sample_dir、文件长度和 npz key。")
@@ -207,12 +292,43 @@ def build_samples_from_raw_samples(sample_files, his_len, pre_len):
     x_radar = np.stack(X_radar_list)
     y = np.stack(Y_list)
 
+    if return_metadata:
+        return x_nwp, x_radar, y, metadata
     return x_nwp, x_radar, y
+
+
+def fixed_error_map_data(model_trainer, global_index, sample_metadata, run_dir):
+    """Keep the original display case separate from held-out test evaluation."""
+    if global_index == -1 or not model_trainer._is_sample_mode():
+        return None
+    if not 0 <= global_index < len(model_trainer.y):
+        raise ValueError(f"error_map_global_index={global_index} is outside the loaded sample windows")
+    partition = next(name for name in ('train', 'valid', 'test')
+                     if global_index in model_trainer.split_indices[name])
+    info = dict(global_index=int(global_index), partition=partition,
+                purpose='fixed_case_diagnostic', included_in_test_scores=(partition == 'test'))
+    if sample_metadata is not None:
+        info.update(sample_metadata[global_index])
+    with open(os.path.join(run_dir, 'training_summary.json'), encoding='utf-8') as stream:
+        summary = json.load(stream)
+    checkpoint = summary.get('evaluation_checkpoint', 'best' if summary.get('restored_best', True) else 'last')
+    info['checkpoint'] = checkpoint
+    info['checkpoint_epoch'] = summary.get('evaluation_epoch',
+        summary['best_epoch'] if checkpoint == 'best' else summary['epochs_run'])
+    info['checkpoint_path'] = os.path.abspath(os.path.join(run_dir, 'checkpoints', checkpoint + '.pt'))
+    print(f"[ERROR MAP] fixed global index={global_index}, partition={partition}; "
+          "held-out scores are computed separately")
+    return dict(x=model_trainer.x[global_index:global_index + 1],
+                y=model_trainer.y[global_index:global_index + 1],
+                radar=model_trainer.radar[global_index:global_index + 1], sample_info=info)
 
 
 if __name__ == "__main__":
     #generateFile(args.k_min, args.k_max)
 
+    sample_metadata = None
+    split_indices = None
+    split_mode = args.split_mode
     # -------------------- 数据入口 --------------------
     if args.input_mode == "patch":
         patch_files = sorted(glob.glob(os.path.join(args.patch_dir, "patch_*.npy")))
@@ -228,6 +344,8 @@ if __name__ == "__main__":
         )
 
         x_radar = None
+        split_mode = 'legacy'
+        print('[SPLIT] patch files have no event/time metadata; using legacy window split')
 
 
     elif args.input_mode == "sample":
@@ -235,34 +353,60 @@ if __name__ == "__main__":
         if len(sample_files) == 0:
             raise RuntimeError(f"sample_dir 下没有找到 *.npz: {args.sample_dir}")
 
-        x, x_radar, y = build_samples_from_raw_samples(
-            sample_files,
-            his_len=args.his_len,
-            pre_len=args.pre_len
-        )
+        if split_mode == 'grouped':
+            x, x_radar, y, sample_metadata = build_samples_from_raw_samples(
+                sample_files, his_len=args.his_len, pre_len=args.pre_len, return_metadata=True
+            )
+            split_indices = grouped_split_indices(
+                sample_metadata, train=args.train, valid=args.valid_ratio, seed=args.seed
+            )
+        else:
+            x, x_radar, y = build_samples_from_raw_samples(
+                sample_files, his_len=args.his_len, pre_len=args.pre_len
+            )
+            print('[SPLIT] legacy diagnostic mode: independent event/day separation is not enforced')
     else:
         raise ValueError(f"Unknown input_mode: {args.input_mode}")
 
-    # -------------------- graph evolution --------------------
-    other_adj = []
-    pop_num = 2 + args.k_max - args.k_min + 1
-    E = Evolution(pop=pop_num, iter=args.iter, cross_pro=args.cross_pro, mutation_pro=args.mutation_pro,
-                  index_group=[args.k_min, args.k_max], his_len=args.his_len,
-                  pre_len=args.pre_len)
-    E.register_on_new_generation(print_genetation)
-    adj_set = []
-    front = E.evolve(other_adj=other_adj)
-    np.save(args.pareto, E.history)
-    best = E.acc_best(front)
-    print('--------------------------------best--------------------------------')
-    model_par = 0
-    for b in best:
-        adj = b.index_to_matrix() + np.eye(b.matrix_size)
-        model_par += 1
-        adj_set.append(adj)
-    np.save(args.adj_Set, adj_set)
+    if args.input_mode == 'sample' and args.error_map_global_index != -1:
+        if not 0 <= args.error_map_global_index < len(y):
+            raise ValueError(f"error_map_global_index={args.error_map_global_index} must be -1 or within [0, {len(y)})")
+
+    # -------------------- fixed graph / graph evolution --------------------
+    if args.regenerate_adj or not os.path.isfile(args.adj_Set):
+        reason = "requested" if args.regenerate_adj else "fixed graph file not found"
+        print(f"[ADJ] running graph evolution: {reason}")
+        other_adj = []
+        pop_num = 2 + args.k_max - args.k_min + 1
+        E = Evolution(pop=pop_num, iter=args.iter, cross_pro=args.cross_pro, mutation_pro=args.mutation_pro,
+                      index_group=[args.k_min, args.k_max], his_len=args.his_len,
+                      pre_len=args.pre_len)
+        E.register_on_new_generation(print_genetation)
+        adj_set = []
+        front = E.evolve(other_adj=other_adj)
+        np.save(args.pareto, E.history)
+        best = E.acc_best(front)
+        print('--------------------------------best--------------------------------')
+        for b in best:
+            adj_set.append(b.index_to_matrix() + np.eye(b.matrix_size))
+        np.save(args.adj_Set, np.asarray(adj_set))
+    else:
+        print(f"[ADJ] reusing fixed graph: {args.adj_Set}")
+
+    fixed_adj_set = np.load(args.adj_Set)
+    if fixed_adj_set.ndim == 2:
+        fixed_adj_set = fixed_adj_set[None, ...]
+    expected_shape = (args.nodes, args.nodes)
+    if fixed_adj_set.ndim != 3 or fixed_adj_set.shape[1:] != expected_shape:
+        raise ValueError(
+            f"Invalid fixed adjacency shape {fixed_adj_set.shape}; expected [K, {args.nodes}, {args.nodes}]"
+        )
+    adj_fingerprint = hashlib.sha256(np.ascontiguousarray(fixed_adj_set).tobytes()).hexdigest()[:16]
+    print(f"[ADJ] shape={fixed_adj_set.shape}, fingerprint={adj_fingerprint}")
 
     # -------------------- model --------------------
+    # Decouple model initialization from random numbers consumed by graph evolution.
+    setup_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     # 控制是否使用因果图
     causal = False
@@ -272,7 +416,7 @@ if __name__ == "__main__":
             return A / (row_sum + 1e-8)
 
 
-        A_ge = np.load(args.adj_Set)[0].astype(np.float32)
+        A_ge = fixed_adj_set[0].astype(np.float32)
         A_cau = np.load(args.causal_adj).astype(np.float32)
         if A_ge.shape != A_cau.shape:
             raise ValueError(f"A_ge shape {A_ge.shape} != A_cau shape {A_cau.shape}")
@@ -282,7 +426,7 @@ if __name__ == "__main__":
         A_final = row_normalize(A_final)
         adj = torch.tensor(A_final, dtype=torch.float32)
     else:
-        adj = torch.tensor(np.load(args.adj_Set)[0], dtype=torch.float32)
+        adj = torch.tensor(fixed_adj_set[0], dtype=torch.float32)
 
     model = STDGN(
         num_units=args.units,
@@ -294,9 +438,30 @@ if __name__ == "__main__":
         pre_len=args.pre_len,
         device=device,
         deep=args.depth,
-        input_mode=args.input_mode
+        input_mode=args.input_mode,
+        nwp_fusion=args.nwp_fusion,
+        spatial_decoder=args.spatial_decoder,
+        decoder_width=args.decoder_width
     )
+    decoder_params = sum(p.numel() for p in model.spatial_decoder.parameters()) if model.spatial_decoder is not None else 0
+    print(f"[MODEL] spatial_decoder={args.spatial_decoder}, width={args.decoder_width}, "
+          f"decoder_params={decoder_params}, total_params={sum(p.numel() for p in model.parameters())}")
 
+    os.makedirs(args.run_dir, exist_ok=True)
+    with open(os.path.join(args.run_dir, 'run_config.json'), 'w', encoding='utf-8') as stream:
+        json.dump(dict(vars(args), effective_split_mode=split_mode, adj_fingerprint=adj_fingerprint),
+                  stream, ensure_ascii=False, indent=2)
+    training_options = dict(
+        loss_mode=args.loss_mode,
+        pm_loss_weight=args.pm_loss_weight, pm_loss_scale=args.pm_loss_scale,
+        fal_loss_weight=args.fal_loss_weight, fcl_loss_weight=args.fcl_loss_weight,
+        spectral_loss_scale=args.spectral_loss_scale,
+        split_indices=split_indices, sample_metadata=sample_metadata, split_mode=split_mode,
+        valid_ratio=args.valid_ratio, log_dir=args.run_dir,
+        checkpoint_dir=os.path.join(args.run_dir, 'checkpoints'),
+        early_stopping_patience=args.early_stopping_patience, restore_best=(args.eval_checkpoint == 'best'),
+        checkpoint_metric=args.checkpoint_metric, strong_validation_weight=args.strong_validation_weight
+    )
     # -------------------- trainer / tester --------------------
     if args.input_mode == "patch":
         model_trainer = trainer(
@@ -311,11 +476,18 @@ if __name__ == "__main__":
             y=y,
             train=args.train,
             valid=None,
-            device=device
+            device=device,
+            seed=args.seed,
+            mm_loss_weight=args.mm_loss_weight,
+            mm_loss_scale=args.mm_loss_scale,
+            coverage_loss_weight=args.coverage_loss_weight,
+            core_loss_weight=args.core_loss_weight,
+            **training_options
         )
 
         _, model = model_trainer.train()
-        test(model, his_step=args.his_len, pre_step=args.pre_len, x=x, y=y)
+        test(model, his_step=args.his_len, pre_step=args.pre_len,
+             norm_dir=args.run_dir, output_dir=args.run_dir, **model_trainer.get_test_data())
 
     else:
         # 注意：
@@ -335,7 +507,13 @@ if __name__ == "__main__":
             y=y,
             train=args.train,
             valid=None,
-            device=device
+            device=device,
+            seed=args.seed,
+            mm_loss_weight=args.mm_loss_weight,
+            mm_loss_scale=args.mm_loss_scale,
+            coverage_loss_weight=args.coverage_loss_weight,
+            core_loss_weight=args.core_loss_weight,
+            **training_options
         )
 
         _, model = model_trainer.train()
@@ -343,7 +521,11 @@ if __name__ == "__main__":
             model,
             his_step=args.his_len,
             pre_step=args.pre_len,
-            x=x,
-            y=y,
-            radar=x_radar
+            norm_dir=args.run_dir,
+            output_dir=args.run_dir,
+            sample_indices=model_trainer.test_indices,
+            sample_metadata=sample_metadata,
+            error_map_data=fixed_error_map_data(model_trainer, args.error_map_global_index,
+                                                sample_metadata, args.run_dir),
+            **model_trainer.get_test_data()
         )

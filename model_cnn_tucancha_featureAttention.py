@@ -77,11 +77,8 @@ class DGNCell(nn.Module):
         super(DGNCell, self).__init__()
         self.nodes = num_nodes
         self.units = num_units
-        # 从TGC网络出来时的特征数目
-        if cuda_gpu:
-            _adj = adj.to(device)
-
-        self.base_adj = _adj
+        # Follow model device moves without changing legacy checkpoint keys.
+        self.register_buffer("base_adj", adj.to(device), persistent=False)
 
         self.gcn_1 = DenseGNN(2 * num_units, 2 * self.units, gdep=deep, dropout=0.1, device=device)
         self.gcn_2 = DenseGNN(2 * num_units, self.units, gdep=deep, dropout=0.1, device=device)
@@ -212,11 +209,58 @@ class STDGN_woa(nn.Module):
         return y_hat, logit_rain
 
 
+class SpatialResidualDecoder(nn.Module):
+    """Fuse 32/16/8 spatial features into per-lead regression-logit residuals.
+
+    Nodes must follow the row-major grid order used by the CNN frontend.
+    A zero-initialized output starts from the original regression forecast.
+    """
+    def __init__(self, in_channels, pre_len, width=32, grid_size=32):
+        super().__init__()
+        if width < 1 or grid_size < 4 or grid_size % 4:
+            raise ValueError("Decoder width must be positive and grid size a multiple of 4")
+        self.grid_size = grid_size
+        groups = math.gcd(8, width)
+
+        def block():
+            return nn.Sequential(
+                nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(groups, width),
+                nn.ReLU(inplace=True),
+            )
+
+        self.project = nn.Conv2d(in_channels, width, kernel_size=1)
+        self.fine = block()
+        self.middle = block()
+        self.coarse = block()
+        self.fuse_middle = block()
+        self.fuse_fine = block()
+        self.output = nn.Conv2d(width, pre_len, kernel_size=3, padding=1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, node_features):
+        b, n, channels = node_features.shape
+        if n != self.grid_size ** 2:
+            raise ValueError(f"Spatial decoder needs {self.grid_size ** 2} row-major nodes, got {n}")
+        field = node_features.transpose(1, 2).reshape(b, channels, self.grid_size, self.grid_size)
+        fine = self.fine(self.project(field))
+        middle = self.middle(F.avg_pool2d(fine, kernel_size=2))
+        coarse = self.coarse(F.avg_pool2d(middle, kernel_size=2))
+        middle = self.fuse_middle(middle + F.interpolate(
+            coarse, size=middle.shape[-2:], mode="bilinear", align_corners=False))
+        fine = self.fuse_fine(fine + F.interpolate(
+            middle, size=fine.shape[-2:], mode="bilinear", align_corners=False))
+        # [B, pre, H, W] -> [B, N, pre], preserving target node order.
+        return self.output(fine).flatten(2).transpose(1, 2).contiguous()
+
+
 class STDGN(nn.Module):
     name = "STDGN"
 
     def __init__(self, num_units, adj, num_nodes, num_feature, num_head,
-                 seq_len, pre_len, device, deep=1, input_mode="patch"):
+                 seq_len, pre_len, device, deep=1, input_mode="patch", nwp_fusion="mean",
+                 spatial_decoder="none", decoder_width=32):
         super(STDGN, self).__init__()
         self.device = device
         self.seq = seq_len
@@ -224,9 +268,13 @@ class STDGN(nn.Module):
         self.head = num_head
         self.hidden_size = num_units
         self.input_mode = input_mode
+        if spatial_decoder not in ("none", "multiscale"):
+            raise ValueError(f"Unsupported spatial decoder: {spatial_decoder}")
+        if spatial_decoder == "multiscale" and num_nodes != 32 * 32:
+            raise ValueError("Multiscale decoder requires a 32x32 row-major grid (1024 nodes)")
 
         if self.input_mode == "sample":
-            self.frontend = CNNFrontEnd()
+            self.frontend = CNNFrontEnd(fusion=nwp_fusion)
             num_feature = self.frontend.out_dim
         else:
             self.frontend = None
@@ -242,6 +290,12 @@ class STDGN(nn.Module):
 
         self.drop = nn.Dropout(0.1)
         self.reset_parameters()
+        # Initialize after the backbone so same-seed backbone weights remain
+        # identical in the decoder ablation.
+        self.spatial_decoder = (
+            SpatialResidualDecoder(2 * num_units, pre_len, width=decoder_width)
+            if spatial_decoder == "multiscale" else None
+        )
 
     def reset_parameters(self):
         torch.nn.init.xavier_uniform_(self.reg_head.weight, gain=1)
@@ -299,11 +353,11 @@ class STDGN(nn.Module):
         feat = torch.cat((seq_list[:, :, -1, :], attn_applied), dim=2)
         feat2 = feat.view(batch_size * self.nodes, -1)
 
-        # 防止rmse异常修改
-        # (原)y_hat = F.softplus(self.reg_head(feat2)).view(batch_size, self.nodes, -1)
-        y_hat = torch.sigmoid(self.reg_head(feat2)).view(batch_size, self.nodes, -1)
+        reg_logits = self.reg_head(feat2).view(batch_size, self.nodes, -1)
+        if self.spatial_decoder is not None:
+            reg_logits = reg_logits + self.spatial_decoder(feat)
+        y_hat = torch.sigmoid(reg_logits)
         logit_rain = self.cls_head(feat2).view(batch_size, self.nodes, -1)
-
         return y_hat, logit_rain
 
 
