@@ -73,12 +73,18 @@ class DenseGNN(nn.Module):
 
 # DenseGNN Cell is used in processing spatial relations in STDGN
 class DGNCell(nn.Module):
-    def __init__(self, num_units, adj, num_nodes, device, deep, emb_dim=16):
+    def __init__(self, num_units, adj, num_nodes, device, deep, emb_dim=16, self_loop_policy="legacy_double"):
         super(DGNCell, self).__init__()
         self.nodes = num_nodes
         self.units = num_units
         # Follow model device moves without changing legacy checkpoint keys.
-        self.register_buffer("base_adj", adj.to(device), persistent=False)
+        if self_loop_policy not in ("single", "legacy_double"):
+            raise ValueError("Unknown self-loop policy")
+        self.self_loop_policy = self_loop_policy
+        base = adj.to(device).clone()
+        if self_loop_policy == "single":
+            base.fill_diagonal_(0)
+        self.register_buffer("base_adj", base, persistent=False)
 
         self.gcn_1 = DenseGNN(2 * num_units, 2 * self.units, gdep=deep, dropout=0.1, device=device)
         self.gcn_2 = DenseGNN(2 * num_units, self.units, gdep=deep, dropout=0.1, device=device)
@@ -215,11 +221,24 @@ class SpatialResidualDecoder(nn.Module):
     Nodes must follow the row-major grid order used by the CNN frontend.
     A zero-initialized output starts from the original regression forecast.
     """
-    def __init__(self, in_channels, pre_len, width=32, grid_size=32):
+    def __init__(self, in_channels, pre_len, width=32, grid_size=32, deterministic_upsampling=False):
         super().__init__()
         if width < 1 or grid_size < 4 or grid_size % 4:
             raise ValueError("Decoder width must be positive and grid size a multiple of 4")
         self.grid_size = grid_size
+        self.deterministic_upsampling = deterministic_upsampling
+        if deterministic_upsampling:
+            def interpolation_matrix(size):
+                matrix = torch.zeros(2 * size, size)
+                for i in range(2 * size):
+                    position = (i + .5) / 2 - .5
+                    lower = math.floor(position)
+                    fraction = position - lower
+                    matrix[i, max(0, min(size - 1, lower))] += 1 - fraction
+                    matrix[i, max(0, min(size - 1, lower + 1))] += fraction
+                return matrix
+            self.register_buffer("upsample_middle", interpolation_matrix(grid_size // 4), persistent=False)
+            self.register_buffer("upsample_fine", interpolation_matrix(grid_size // 2), persistent=False)
         groups = math.gcd(8, width)
 
         def block():
@@ -239,6 +258,12 @@ class SpatialResidualDecoder(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
+    def upsample(self, values, matrix):
+        # Bilinear 2x, align_corners=False, expressed as separable matmuls.
+        # Avoids CUDA interpolation-backward atomic accumulation.
+        matrix = matrix.to(dtype=values.dtype)
+        return torch.matmul(torch.matmul(matrix, values), matrix.t())
+
     def forward(self, node_features):
         b, n, channels = node_features.shape
         if n != self.grid_size ** 2:
@@ -247,10 +272,14 @@ class SpatialResidualDecoder(nn.Module):
         fine = self.fine(self.project(field))
         middle = self.middle(F.avg_pool2d(fine, kernel_size=2))
         coarse = self.coarse(F.avg_pool2d(middle, kernel_size=2))
-        middle = self.fuse_middle(middle + F.interpolate(
-            coarse, size=middle.shape[-2:], mode="bilinear", align_corners=False))
-        fine = self.fuse_fine(fine + F.interpolate(
-            middle, size=fine.shape[-2:], mode="bilinear", align_corners=False))
+        if self.deterministic_upsampling:
+            middle = self.fuse_middle(middle + self.upsample(coarse, self.upsample_middle))
+            fine = self.fuse_fine(fine + self.upsample(middle, self.upsample_fine))
+        else:
+            middle = self.fuse_middle(middle + F.interpolate(
+                coarse, size=middle.shape[-2:], mode="bilinear", align_corners=False))
+            fine = self.fuse_fine(fine + F.interpolate(
+                middle, size=fine.shape[-2:], mode="bilinear", align_corners=False))
         # [B, pre, H, W] -> [B, N, pre], preserving target node order.
         return self.output(fine).flatten(2).transpose(1, 2).contiguous()
 
@@ -260,7 +289,9 @@ class STDGN(nn.Module):
 
     def __init__(self, num_units, adj, num_nodes, num_feature, num_head,
                  seq_len, pre_len, device, deep=1, input_mode="patch", nwp_fusion="mean",
-                 spatial_decoder="none", decoder_width=32):
+                 spatial_decoder="none", decoder_width=32, input_sources="radar_nwp", nwp_features=None,
+                 radar_encoding="scaled", self_loop_policy="legacy_double", deterministic_upsampling=False,
+                 input_invalid_fill="mean"):
         super(STDGN, self).__init__()
         self.device = device
         self.seq = seq_len
@@ -268,22 +299,30 @@ class STDGN(nn.Module):
         self.head = num_head
         self.hidden_size = num_units
         self.input_mode = input_mode
+        self.input_sources = input_sources
+        if input_sources not in ('radar', 'radar_nwp', 'radar_aux'):
+            raise ValueError('input_sources must be radar, radar_nwp or radar_aux')
+        if input_sources in ('radar', 'radar_aux') and input_mode != 'sample':
+            raise ValueError('radar-only input requires sample mode')
         if spatial_decoder not in ("none", "multiscale"):
             raise ValueError(f"Unsupported spatial decoder: {spatial_decoder}")
         if spatial_decoder == "multiscale" and num_nodes != 32 * 32:
             raise ValueError("Multiscale decoder requires a 32x32 row-major grid (1024 nodes)")
 
         if self.input_mode == "sample":
-            self.frontend = CNNFrontEnd(fusion=nwp_fusion)
+            self.frontend = CNNFrontEnd(fusion=nwp_fusion, input_sources=input_sources,
+                                        nwp_features=nwp_features, radar_encoding=radar_encoding,
+                                        input_invalid_fill=input_invalid_fill)
             num_feature = self.frontend.out_dim
         else:
             self.frontend = None
+        self.nwp_features = self.frontend.nwp_features if self.frontend is not None else None
 
         self.attn = nn.ModuleList([AttEncoderLayer(num_units, seq_len, device) for _ in range(num_head)])
         self.reg_head = nn.Linear(2 * num_units, pre_len)
         self.cls_head = nn.Linear(2 * num_units, pre_len)
 
-        self.dgncell = DGNCell(num_units, adj, num_nodes, device, deep)
+        self.dgncell = DGNCell(num_units, adj, num_nodes, device, deep, self_loop_policy=self_loop_policy)
         # 新增特征注意力
         self.feat_attn = FeatureAttention(num_feature)
         self.seq_linear = nn.Linear(num_feature, num_units)
@@ -293,7 +332,8 @@ class STDGN(nn.Module):
         # Initialize after the backbone so same-seed backbone weights remain
         # identical in the decoder ablation.
         self.spatial_decoder = (
-            SpatialResidualDecoder(2 * num_units, pre_len, width=decoder_width)
+            SpatialResidualDecoder(2 * num_units, pre_len, width=decoder_width,
+                                   deterministic_upsampling=deterministic_upsampling)
             if spatial_decoder == "multiscale" else None
         )
 

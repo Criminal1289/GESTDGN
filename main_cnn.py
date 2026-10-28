@@ -4,12 +4,14 @@ import torch
 import argparse
 import hashlib
 import json
+import shutil
 import numpy as np
 from model_cnn_tucancha_featureAttention import STDGN
 from graph_evolution import Evolution, print_genetation
 from trainer_cnn import trainer, setup_seed
 from tester_cnn import test
 from precip_split import grouped_split_indices, window_metadata
+from precip_inputs import MOISTURE_FEATURES, select_nwp_features
 import glob, os
 from make_index_and_station_pro import generateFile
 
@@ -57,6 +59,8 @@ parser.add_argument('--pm_loss_weight', type=float, default=1.0,
                     help='PM coefficient; mse_pm with 0 runs pure physical rainfall MSE')
 parser.add_argument('--pm_loss_scale', type=float, default=10.0,
                     help='shared physical rainfall scale for MSE and PM in mse_pm mode, in mm')
+parser.add_argument('--mse_lead_weights', type=float, nargs='+', default=None,
+                    help='mse_pm only: positive per-lead pointwise MSE weights, normalized by their sum; default equal')
 parser.add_argument('--fal_loss_weight', type=float, default=0.0,
                     help='optional Fourier amplitude auxiliary weight (disabled by default)')
 parser.add_argument('--fcl_loss_weight', type=float, default=0.0,
@@ -75,10 +79,13 @@ parser.add_argument('--eval_checkpoint', choices=['last', 'best'], default='last
                     help='weights used after training: last uses the final epoch, best restores validation-selected weights')
 parser.add_argument('--strong_validation_weight', type=float, default=0.25,
                     help='fixed weight of >=7mm conditional RMSE in validation selection, not training loss')
-parser.add_argument('--run_dir', type=str, default='runs/mse_pm',
+parser.add_argument('--run_dir', type=str, default=None,
                     help='directory for this run normalization, split, checkpoint, metrics and figures')
 parser.add_argument('--error_map_global_index', type=int, default=65,
                     help='fixed original raw-sample window for diagnostic maps; -1 uses the held-out test case')
+parser.add_argument('--error_map_save_dir', type=str,
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fig_step_error_maps'),
+                    help='overwrite STEP0_3_GT_PRED_ERROR_MAPS.png here after evaluation')
 
 # hyper-parameter of graph evolution
 parser.add_argument('--num_CUDA', type=int, default='1', help='number of CUDA used in graph evolution')
@@ -93,6 +100,10 @@ parser.add_argument('--tournament', type=int, default=5, help='number of selecti
 parser.add_argument('--pareto', type=str, default='data/Pareto(GE)', help='pareto front of no dominant')
 
 parser.add_argument('--input_mode', type=str, default='sample', help='patch or sample(CNN)')
+parser.add_argument('--input_sources', choices=['radar', 'radar_nwp', 'radar_aux'], default='radar',
+                    help='sample inputs: radar only (default) or the original Radar+NWP concatenation')
+parser.add_argument('--nwp_features', nargs='+', default=None,
+                    help='radar_aux: NWP variable names; default PWAT Q850 RH700')
 parser.add_argument('--nwp_fusion', choices=['mean', 'center'], default='mean',
                     help='mean: fuse all NWP windows; center: use window 0 only')
 parser.add_argument('--sample_dir', type=str, default='../gestdgn/data/cnn_spatial_align_slide',
@@ -103,6 +114,20 @@ parser.add_argument('--causal_adj',type=str,default='causal/A_cau_ra.npy',help='
 parser.add_argument('--causal_beta',type=float,default=0.1,help='weight of causal adjacency')
 
 args = parser.parse_args()
+if args.input_sources in ('radar', 'radar_aux') and args.input_mode != 'sample':
+    parser.error('radar-only input requires --input_mode sample; patch runs use --input_sources radar_nwp')
+if args.input_sources in ('radar', 'radar_aux') and args.regenerate_adj:
+    parser.error('radar-only control reuses the fixed adjacency; do not regenerate it with NWP-based fitness')
+if args.run_dir is None:
+    name = {'radar': 'radar_only', 'radar_nwp': 'radar_nwp', 'radar_aux': 'radar_aux'}[args.input_sources]
+    pm_tag = format(args.pm_loss_weight, 'g').replace('.', 'p')
+    args.run_dir = f'runs/{name}_pm{pm_tag}'
+if args.input_sources == 'radar_aux':
+    args.nwp_features = args.nwp_features or list(MOISTURE_FEATURES)
+    if len(set(args.nwp_features)) != len(args.nwp_features):
+        parser.error('NWP features must be unique')
+elif args.nwp_features is not None:
+    parser.error('--nwp_features is only supported with --input_sources radar_aux')
 if args.loss_mode == 'mse_pm' and any(getattr(args, name) != 0 for name in
         ('mm_loss_weight', 'core_loss_weight', 'coverage_loss_weight', 'fal_loss_weight', 'fcl_loss_weight')):
     parser.error('mse_pm uses only MSE + PM; auxiliary weights must be 0 (use --loss_mode legacy for the previous objective)')
@@ -208,18 +233,21 @@ def build_samples_from_raw_samples(sample_files, his_len, pre_len, return_metada
     for p in sample_files:
         raw = np.load(p, allow_pickle=True)
 
-        nwp = _pick_key(raw, ['nwp', 'NWP', 'x_nwp'], p)
         radar = _pick_key(raw, ['radar', 'RADAR', 'x_radar'], p)
         label = _pick_key(raw, ['label', 'LABEL', 'y', 'rain', 'target'], p)
-        nwp = _clean_nwp_array(nwp, p)
-        if args.nwp_fusion == 'center':
+        radar_only = args.input_sources == 'radar'
+        # Retain the trainer's two-input calling convention with a tiny dummy.
+        # No NWP array is read, cleaned or transferred to the GPU in radar-only mode.
+        nwp = (np.zeros((radar.shape[0], 1), dtype=np.float32) if radar_only else
+               _clean_nwp_array(select_nwp_features(raw, args.nwp_features), p))
+        if not radar_only and args.nwp_fusion == 'center':
             if 'slide_offsets' not in raw or not np.array_equal(raw['slide_offsets'][0], [0, 0]):
                 raise ValueError(f'{p}: center fusion requires slide_offsets[0] == [0, 0]')
 
         if label.ndim == 4 and label.shape[1] == 1:
             label = label[:, 0, :, :]  # [T, H, W]
 
-        if nwp.ndim != 5:
+        if not radar_only and nwp.ndim != 5:
             raise ValueError(f"{os.path.basename(p)} nwp 期望 5 维 [T,Nw,C,H,W]，实际 {nwp.shape}")
         if radar.ndim != 4:
             raise ValueError(f"{os.path.basename(p)} radar 期望 4 维 [T,C,H,W]，实际 {radar.shape}")
@@ -313,6 +341,8 @@ def fixed_error_map_data(model_trainer, global_index, sample_metadata, run_dir):
         summary = json.load(stream)
     checkpoint = summary.get('evaluation_checkpoint', 'best' if summary.get('restored_best', True) else 'last')
     info['checkpoint'] = checkpoint
+    info['input_sources'] = getattr(getattr(model_trainer, 'model', None), 'input_sources', 'radar_nwp')
+    info['nwp_features'] = getattr(getattr(model_trainer, 'model', None), 'nwp_features', None)
     info['checkpoint_epoch'] = summary.get('evaluation_epoch',
         summary['best_epoch'] if checkpoint == 'best' else summary['epochs_run'])
     info['checkpoint_path'] = os.path.abspath(os.path.join(run_dir, 'checkpoints', checkpoint + '.pt'))
@@ -321,6 +351,19 @@ def fixed_error_map_data(model_trainer, global_index, sample_metadata, run_dir):
     return dict(x=model_trainer.x[global_index:global_index + 1],
                 y=model_trainer.y[global_index:global_index + 1],
                 radar=model_trainer.radar[global_index:global_index + 1], sample_info=info)
+
+
+def publish_error_map(run_dir, save_dir):
+    """Overwrite the requested display PNG while keeping run artifacts isolated."""
+    filename = 'STEP0_3_GT_PRED_ERROR_MAPS.png'
+    source = os.path.abspath(os.path.join(run_dir, 'fig_step_error_maps', filename))
+    destination = os.path.abspath(os.path.join(save_dir, filename))
+    if not os.path.isfile(source):
+        raise FileNotFoundError('Evaluation did not generate the error map: ' + source)
+    os.makedirs(save_dir, exist_ok=True)
+    if os.path.normcase(source) != os.path.normcase(destination):
+        shutil.copy2(source, destination)
+    print('[ERROR MAP] updated: ' + destination)
 
 
 if __name__ == "__main__":
@@ -374,6 +417,8 @@ if __name__ == "__main__":
 
     # -------------------- fixed graph / graph evolution --------------------
     if args.regenerate_adj or not os.path.isfile(args.adj_Set):
+        if args.input_sources in ('radar', 'radar_aux'):
+            raise FileNotFoundError('Radar-only control requires the existing fixed adjacency: ' + args.adj_Set)
         reason = "requested" if args.regenerate_adj else "fixed graph file not found"
         print(f"[ADJ] running graph evolution: {reason}")
         other_adj = []
@@ -441,11 +486,14 @@ if __name__ == "__main__":
         input_mode=args.input_mode,
         nwp_fusion=args.nwp_fusion,
         spatial_decoder=args.spatial_decoder,
-        decoder_width=args.decoder_width
+        decoder_width=args.decoder_width,
+        input_sources=args.input_sources, nwp_features=args.nwp_features
     )
     decoder_params = sum(p.numel() for p in model.spatial_decoder.parameters()) if model.spatial_decoder is not None else 0
-    print(f"[MODEL] spatial_decoder={args.spatial_decoder}, width={args.decoder_width}, "
+    print(f"[MODEL] input_sources={args.input_sources}, spatial_decoder={args.spatial_decoder}, width={args.decoder_width}, "
           f"decoder_params={decoder_params}, total_params={sum(p.numel() for p in model.parameters())}")
+    if args.input_sources == 'radar_aux':
+        print(f'[INPUT] auxiliary NWP features={args.nwp_features}, radar width={model.frontend.out_dim}')
 
     os.makedirs(args.run_dir, exist_ok=True)
     with open(os.path.join(args.run_dir, 'run_config.json'), 'w', encoding='utf-8') as stream:
@@ -453,6 +501,7 @@ if __name__ == "__main__":
                   stream, ensure_ascii=False, indent=2)
     training_options = dict(
         loss_mode=args.loss_mode,
+        mse_lead_weights=args.mse_lead_weights,
         pm_loss_weight=args.pm_loss_weight, pm_loss_scale=args.pm_loss_scale,
         fal_loss_weight=args.fal_loss_weight, fcl_loss_weight=args.fcl_loss_weight,
         spectral_loss_scale=args.spectral_loss_scale,
@@ -529,3 +578,5 @@ if __name__ == "__main__":
                                                 sample_metadata, args.run_dir),
             **model_trainer.get_test_data()
         )
+
+    publish_error_map(args.run_dir, args.error_map_save_dir)

@@ -399,7 +399,8 @@ class trainer():
                  fal_loss_weight=0.0, fcl_loss_weight=0.0, spectral_loss_scale=10.0,
                  split_indices=None, sample_metadata=None, split_mode="legacy", valid_ratio=0.05,
                  log_dir=None, early_stopping_patience=0, restore_best=True,
-                 checkpoint_metric="all", strong_validation_weight=0.25, loss_mode="mse_pm"):
+                 checkpoint_metric="all", strong_validation_weight=0.25, loss_mode="mse_pm",
+                 mse_lead_weights=None):
         self.epoch = epoch
         self.batch = batch
         self.model = model
@@ -450,6 +451,13 @@ class trainer():
         if loss_mode not in ('mse_pm', 'legacy'):
             raise ValueError('loss_mode must be mse_pm or legacy')
         self.loss_mode = loss_mode
+        self.mse_lead_weights = None if mse_lead_weights is None else [float(w) for w in mse_lead_weights]
+        if self.mse_lead_weights is not None:
+            if (len(self.mse_lead_weights) != self.pre
+                    or any(not math.isfinite(w) or w <= 0 for w in self.mse_lead_weights)):
+                raise ValueError('mse_lead_weights must contain one finite positive weight per lead')
+            if loss_mode != 'mse_pm':
+                raise ValueError('mse_lead_weights is supported only for mse_pm')
         if loss_mode == 'mse_pm' and any(getattr(self, name) != 0 for name in
                 ('mm_loss_weight', 'core_loss_weight', 'coverage_loss_weight', 'fal_loss_weight', 'fcl_loss_weight')):
             raise ValueError('mse_pm uses only MSE + PM; auxiliary weights must be 0 (use loss_mode="legacy" for the previous objective)')
@@ -627,8 +635,8 @@ class trainer():
             frontend.fit_normalization(train_x, train_radar)
             np.savez(
                 os.path.join(self.log_dir, "input_normalization_stats.npz"),
-                nwp_mean=frontend.nwp_mean.detach().cpu().numpy(),
-                nwp_std=frontend.nwp_std.detach().cpu().numpy(),
+                **({name: getattr(frontend, name).detach().cpu().numpy()
+                    for name in ('nwp_mean', 'nwp_std')} if hasattr(frontend, 'nwp_mean') else {}),
                 radar_mean=frontend.radar_mean.detach().cpu().numpy(),
                 radar_std=frontend.radar_std.detach().cpu().numpy(),
             )
@@ -744,7 +752,7 @@ class trainer():
                 if self.loss_mode == 'mse_pm':
                     objective, loss_mse, loss_pm = mse_pm_loss(
                         pred_mm, target_mm, pm_weight=self.pm_loss_weight,
-                        scale_mm=self.pm_loss_scale
+                        scale_mm=self.pm_loss_scale, mse_lead_weights=self.mse_lead_weights
                     )
                 else:
                     per = Fu.smooth_l1_loss(y_hat, target, reduction="none")
@@ -911,12 +919,14 @@ class trainer():
                 if improved_selected or improved_all or improved_strong:
                     state = {key:value.detach().cpu().clone() for key,value in self.model.state_dict().items()}
                     payload = dict(model_state_dict=state, epoch=e+1,
+                        input_sources=getattr(self.model, 'input_sources', 'radar_nwp'),
+                        nwp_features=getattr(self.model, 'nwp_features', None),
                         valid_rmse_all=float(rmse_all), valid_rmse_rain=float(rmse_rain),
                         validation_metrics=metrics, checkpoint_metric=self.checkpoint_metric,
                         strong_validation_weight=self.strong_validation_weight,
                         y_log_min=y_log_min, y_log_max=y_log_max,
                         loss_config={name:getattr(self,name) for name in
-                            ('loss_mode','mm_loss_weight','mm_loss_scale','core_loss_weight','coverage_loss_weight',
+                            ('loss_mode','mse_lead_weights','mm_loss_weight','mm_loss_scale','core_loss_weight','coverage_loss_weight',
                              'pm_loss_weight','pm_loss_scale','fal_loss_weight','fcl_loss_weight','spectral_loss_scale')},
                         split_mode=self.split_mode, seed=self.seed,
                         split_indices=({k:v.tolist() for k,v in self.split_indices.items()}
@@ -977,7 +987,10 @@ class trainer():
                            restored_best=self.restore_best, split_mode=self.split_mode,
                            evaluation_checkpoint=('best' if self.restore_best else 'last'),
                            evaluation_epoch=(self.best_epoch if self.restore_best else len(train_loss)),
-                           loss_mode=self.loss_mode, pm_loss_weight=self.pm_loss_weight,
+                           loss_mode=self.loss_mode, mse_lead_weights=self.mse_lead_weights,
+                           input_sources=getattr(self.model, 'input_sources', 'radar_nwp'),
+                           nwp_features=getattr(self.model, 'nwp_features', None),
+                           pm_loss_weight=self.pm_loss_weight,
                            pm_loss_scale=self.pm_loss_scale,
                            early_stopping_patience=self.early_stopping_patience,
                            checkpoint_metric=self.checkpoint_metric,
@@ -995,6 +1008,8 @@ class trainer():
                 os.path.join(self.log_dir, "train_Loss_components_" + model_name + ".npz"),
                 **{key: np.asarray(values) for key, values in loss_components.items()},
                 loss_mode=np.asarray(self.loss_mode),
+                mse_lead_weights=np.asarray(self.mse_lead_weights if self.mse_lead_weights is not None
+                                            else [1.0] * self.pre),
                 mm_loss_weight=np.asarray(self.mm_loss_weight),
                 mm_loss_scale=np.asarray(self.mm_loss_scale),
                 coverage_loss_weight=np.asarray(self.coverage_loss_weight),

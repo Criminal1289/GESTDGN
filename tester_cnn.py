@@ -377,7 +377,7 @@ def plot_step_rmse_proof(outputs, y_hat_mm, fore_y_mm, pre_step, save_dir="fig_s
 
     print(f"[Saved] step proof figures and csv saved to: {save_dir}")
 
-def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_maps", sample_idx=None, grid_shape=None, max_steps=4, sample_info=None):
+def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_maps", sample_idx=None, grid_shape=None, max_steps=4, sample_info=None, show_case_metadata=True):
     """
     绘制 step0-step3 的空间误差图：
     第一行：GT
@@ -512,7 +512,7 @@ def plot_step_error_maps(outputs, fore_y_mm, pre_step, save_dir="fig_step_error_
 
     identity = dict(sample_info or {})
     title_suffix = ""
-    if identity:
+    if identity and show_case_metadata:
         parts = [f"global index {identity['global_index']}"] if 'global_index' in identity else []
         if identity.get('partition'):
             parts.append(str(identity['partition']))

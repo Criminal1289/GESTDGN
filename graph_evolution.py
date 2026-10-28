@@ -1,111 +1,78 @@
-from GE.utils import NSGA2Utils
-from GE.population import Population
-import numpy as np
-import torch
+"""Elitist NSGA-II for binary graph chromosomes, with injectable fitness."""
 import functools
 
+from GE.population import Population
+from GE.utils import NSGA2Utils
 
-class Evolution(object):
-    # 如果有精英保留机制，就直接去重
-    def __init__(self, pop=50, iter=30, cross_pro=0.8, mutation_pro=0.2, matrix_size=1024, tourna_size=5, index=None,
-                 index_group=None, his_len=None, pre_len=None):
+
+class Evolution:
+    def __init__(self, pop=50, iter=30, cross_pro=0.8, mutation_pro=0.2, matrix_size=1024,
+                 tourna_size=5, index=None, index_group=None, his_len=None, pre_len=None,
+                 fitness_evaluator=None, initial_genomes=None, mandatory_mask=None,
+                 undirected=False, seed=None, device=None, unique_population=False):
+        if iter < 0:
+            raise ValueError("Generation count cannot be negative")
         self.utils = NSGA2Utils(pop=pop, iter=iter, cross_pro=cross_pro, mutation_pro=mutation_pro,
-                                matrix_size=matrix_size,
-                                tourna_size=tourna_size, index=index, index_group=index_group)
-
+                               matrix_size=matrix_size, tourna_size=tourna_size, index=index,
+                               index_group=index_group, fitness_evaluator=fitness_evaluator,
+                               initial_genomes=initial_genomes, mandatory_mask=mandatory_mask,
+                               undirected=undirected, seed=seed, device=device, unique_population=unique_population)
         self.population = None
-        self.num_of_generations = iter
-        self.on_generation_finished = []
-        self.history = []
-        self.his_len = his_len
-        self.pre_len = pre_len
+        self.num_of_generations = int(iter)
+        self.on_generation_finished, self.history = [], []
+        self.his_len, self.pre_len = his_len, pre_len
+        self.completed_generations, self.stop_reason = 0, "generation_budget"
 
     def register_on_new_generation(self, fun):
         self.on_generation_finished.append(fun)
 
-    def evolve(self, other_adj=None):
-        self.population = self.utils.create_initial_population(other_adj=other_adj, his_len=self.his_len,
-                                                               pre_len=self.pre_len)
-        self.num_of_individuals = len(self.population)
-        self.utils.fast_nondominated_sort(self.population)
-        for front in self.population.fronts:
+    def _rank(self, population):
+        self.utils.fast_nondominated_sort(population)
+        for front in population.fronts:
             self.utils.calculate_crowding_distance(front)
-        # children = self.utils.create_initial_population()
-        children = self.utils.create_children(self.population.population,his_len=self.his_len,
-                                                               pre_len=self.pre_len)
-        print(len(children))
-        returned_population = None
-        for i in range(self.num_of_generations):
-            self.population.extend(children)
-            self.utils.fast_nondominated_sort(self.population)
-            for front in self.population.fronts:
-                self.utils.calculate_crowding_distance(front)
-            new_population = Population()
-            front_num = 0
-            print(self.num_of_individuals)
-            while len(new_population) + len(self.population.fronts[front_num]) <= self.num_of_individuals:
-                self.utils.calculate_crowding_distance(self.population.fronts[front_num])
-                new_population.extend(self.population.fronts[front_num])
-                front_num += 1
-            sorted(self.population.fronts[front_num], key=functools.cmp_to_key(self.utils.crowding_operator))
-            new_population.extend(self.population.fronts[front_num][0:self.num_of_individuals - len(new_population)])
-            returned_population = self.population
-            self.population = new_population
-            print('children:')
-            children = self.utils.create_children(self.population.population,his_len=self.his_len,
-                                                               pre_len=self.pre_len)
-            print('-----------------------------------------over-------------------------------------------')
-            for fun in self.on_generation_finished:
-                value, his = fun(returned_population, i)
-                if his == 'his':
+
+    def evolve(self, other_adj=None):
+        self.population = self.utils.create_initial_population(other_adj, self.his_len, self.pre_len)
+        self.num_of_individuals = len(self.population)
+        self._rank(self.population)
+        for generation in range(self.num_of_generations):
+            children = self.utils.create_children(self.population.population, self.his_len, self.pre_len)
+            if self.utils.unique_population and not children:
+                self.stop_reason = "search_space_exhausted"
+                break
+            combined = Population()
+            combined.extend(self.population.population + children)
+            if self.utils.unique_population:
+                combined.population = self.utils.deduplicate(combined.population)
+            self._rank(combined)
+            selected = Population()
+            for front in combined.fronts:
+                remaining = self.num_of_individuals - len(selected)
+                if remaining == 0:
+                    break
+                if len(front) <= remaining:
+                    selected.extend(front)
+                else:
+                    ordered = sorted(front, key=functools.cmp_to_key(self.utils.crowding_operator))
+                    selected.extend(ordered[:remaining])
+                    break
+            self.population = selected
+            self._rank(self.population)
+            self.completed_generations = generation + 1
+            for callback in self.on_generation_finished:
+                value, kind = callback(self.population, generation)
+                if kind == "his":
                     self.history.append(value)
-        return list(dict.fromkeys(returned_population.fronts[0]))
+        # Include the last offspring and handle zero generations. No unused
+        # extra generation is trained after final survivor selection.
+        return list(dict.fromkeys(self.population.fronts[0]))
 
     def acc_best(self, fronts):
-        best_value = np.zeros(len(fronts[0].objectives))
-        best_value[:] = float('inf')
-        best_individual = []
-        for m in range(len(fronts[0].objectives)):
-            best_individual.append(None)
-            for f in fronts:
-                if best_value[m] > f.objectives[m]:
-                    best_value[m] = f.objectives[m]
-                    best_individual[m] = f
-
-        return best_individual
+        if not fronts:
+            raise ValueError("No Pareto graphs available")
+        return [min(fronts, key=lambda ind: (ind.objectives[m], tuple(ind.objectives)))
+                for m in range(len(fronts[0].objectives))]
 
 
 def print_genetation(population, genetation):
-    G_set = {}
-    G_obj = list(dict.fromkeys(population.fronts[0]))
-    G_set[genetation] = []
-    for p in G_obj:
-        G_set[genetation].append(p.objectives)
-    return G_set, 'his'
-
-# if __name__ == "__main__":
-#     TIN = np.load('../data/TIN_adj.npy') - np.eye(184)
-#     Dis = np.load('../data/Geo_adj.npy') - np.eye(184)
-#     other_adj = [TIN, Dis]
-#     E = Evolution(pop=20, iter=20, cross_pro=0.8, mutation_pro=0.1, index_group=[6, 23])
-#     E.register_on_new_generation(print_genetation)
-#     adj_set = []
-#     front = E.evolve(other_adj=other_adj)
-#     np.save('data/dictionary.npy', E.history)
-#     print(len(front))
-#     last_front = []
-#     for f in front:
-#         print(f.objectives)
-#         last_front.append(f.adj)
-#     np.save("data/last_front.npy", last_front)
-#     best = E.acc_best(front)
-#     print('--------------------------------best--------------------------------')
-#     model_par = 0
-#     for b in best:
-#         adj = b.index_to_matrix() + np.eye(b.matrix_size)
-#         torch.save(b.model_parameter, 'data/model_par' + str(model_par))
-#         model_par += 1
-#         print(adj)
-#         adj_set.append(adj)
-#         print(b.objectives)
-#     np.save('data/AdjSet(GE).npy', adj_set)
+    return {genetation: [p.objectives for p in dict.fromkeys(population.fronts[0])]}, "his"
